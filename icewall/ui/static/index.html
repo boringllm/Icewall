@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Icewall</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Vendored locally so the graph works with no network connection. -->
+  <script src="/static/vendor/cytoscape.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand"><img class="mark" src="/static/icewall.png" alt="" /> Icewall</div>
+    <nav>
+      <button data-view="scan" class="active">Scan</button>
+      <button data-view="sessions">Sessions</button>
+      <button data-view="presets">Presets</button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="version" id="version">connecting…</div>
+  </header>
+
+  <main>
+    <!-- ================= SCAN ================= -->
+    <section class="view active" id="view-scan">
+      <div class="grid-2">
+        <div class="panel" id="scan-config">
+          <h2>New scan</h2>
+          <div class="field">
+            <label>Target path (repo or file)</label>
+            <input id="target" placeholder="./my-repo or examples/vulnerable_app" />
+          </div>
+          <div class="field">
+            <label>Preset</label>
+            <div class="row">
+              <select id="preset-select"><option value="">— none —</option></select>
+              <button class="ghost" id="load-preset" style="flex:0 0 auto">Load</button>
+            </div>
+          </div>
+          <div class="field check">
+            <input type="checkbox" id="dry-run" />
+            <label for="dry-run" style="margin:0">Dry run — offline mock provider, no API keys, free</label>
+          </div>
+          <div class="field">
+            <label>Scan intensity <span class="muted" style="text-transform:none">— recall vs cost</span></label>
+            <div class="segmented" id="intensity"></div>
+            <div class="muted" id="intensity-desc" style="font-size:12px; margin-top:6px"></div>
+          </div>
+
+          <details class="settings" id="settings">
+            <summary>Configuration</summary>
+            <div id="settings-form"><!-- built by JS --></div>
+            <div class="row" style="margin-top:10px">
+              <input id="preset-name" placeholder="preset name" style="flex:2" />
+              <button class="ghost" id="save-preset" style="flex:0 0 auto">Save as preset</button>
+            </div>
+          </details>
+
+          <div class="spacer-v"></div>
+          <button class="primary" id="start-scan" style="width:100%">Start scan</button>
+        </div>
+
+        <div class="panel" id="scan-live">
+          <div id="live-empty" class="empty-hero muted">
+            <img src="/static/icewall.png" alt="Icewall" class="hero-img" />
+            <div>Configure a target and press <b>Start scan</b>.<br />Live agent activity, the code graph, progress and cost appear here.</div>
+          </div>
+          <div id="live" class="hidden">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px">
+              <h2 style="margin:0">Live scan</h2>
+              <span class="pill running" id="live-status">running</span>
+              <div class="spacer"></div>
+              <a id="live-session-link" class="hidden">Open session dashboard →</a>
+            </div>
+
+            <div class="progress-wrap">
+              <div class="bar"><i id="prog"></i></div>
+              <div class="progress-meta"><span id="prog-label">Starting…</span><span id="prog-pct">0%</span></div>
+            </div>
+
+            <div class="stat-tiles">
+              <div class="tile"><div class="k">Cost</div><div class="v cost" id="t-cost">$0.0000</div></div>
+              <div class="tile"><div class="k">Tokens</div><div class="v" id="t-tokens">0</div></div>
+              <div class="tile"><div class="k">LLM calls</div><div class="v" id="t-calls">0</div></div>
+              <div class="tile"><div class="k">Findings</div><div class="v" id="t-findings">–</div></div>
+            </div>
+
+            <h3>Agents</h3>
+            <div class="agents" id="agents"></div>
+
+            <h3>Code graph</h3>
+            <div id="graph"></div>
+            <div class="legend" id="graph-legend">
+              <span><i style="background:#ff5c7a"></i> sink</span>
+              <span><i style="background:#38e1c6"></i> source</span>
+              <span><i style="background:#4aa8ff"></i> function</span>
+              <span id="graph-count" class="muted"></span>
+            </div>
+
+            <h3 style="margin-top:16px">Event log</h3>
+            <div class="log" id="log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= SESSIONS ================= -->
+    <section class="view" id="view-sessions">
+      <div id="sessions-index">
+        <div style="display:flex; align-items:center">
+          <h2>Sessions</h2><div class="spacer"></div>
+          <button class="ghost" id="refresh-sessions">Refresh</button>
+        </div>
+        <div class="panel" style="margin-top:12px">
+          <table><thead><tr><th>Session</th><th>Target</th><th>Status</th><th>Findings</th><th>Cost</th><th>When</th></tr></thead>
+          <tbody id="sessions-rows"></tbody></table>
+          <div id="sessions-empty" class="muted hidden" style="padding:14px">No sessions yet. Run a scan first.</div>
+        </div>
+      </div>
+
+      <div id="session-detail" class="hidden">
+        <button class="ghost" id="back-sessions">← All sessions</button>
+        <div class="spacer-v"></div>
+        <div style="display:flex; align-items:center; gap:10px">
+          <h2 style="margin:0" id="sd-title">Session</h2>
+          <span class="pill" id="sd-status"></span>
+        </div>
+        <div class="stat-tiles" style="margin-top:12px">
+          <div class="tile"><div class="k">Findings</div><div class="v" id="sd-findings">–</div></div>
+          <div class="tile"><div class="k">Total cost</div><div class="v cost" id="sd-cost">–</div></div>
+          <div class="tile"><div class="k">Tokens</div><div class="v" id="sd-tokens">–</div></div>
+          <div class="tile"><div class="k">LLM calls</div><div class="v" id="sd-calls">–</div></div>
+          <div class="tile"><div class="k">Duration</div><div class="v" id="sd-dur">–</div></div>
+        </div>
+
+        <div class="grid-2" style="grid-template-columns: 1fr 1fr">
+          <div class="panel">
+            <h2>Cost per agent</h2>
+            <div class="costbars" id="sd-costbars"></div>
+          </div>
+          <div class="panel">
+            <h2>Artifacts</h2>
+            <div id="sd-artifacts" class="notes-list"></div>
+            <div class="spacer-v"></div>
+            <h3>Memory (master.md)</h3>
+            <div class="md mono" id="sd-memory" style="max-height:220px; overflow:auto; font-size:12px"></div>
+          </div>
+        </div>
+
+        <div class="spacer-v"></div>
+        <div class="panel">
+          <h2>Findings</h2>
+          <table><thead><tr><th>Sev</th><th>Conf</th><th>Class</th><th>Location</th><th>Entry → Sink</th></tr></thead>
+          <tbody id="sd-findings-rows"></tbody></table>
+        </div>
+
+        <div class="spacer-v"></div>
+        <div class="panel">
+          <h2>Code graph</h2>
+          <div id="sess-graph"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= PRESETS ================= -->
+    <section class="view" id="view-presets">
+      <div class="grid-2">
+        <div class="panel">
+          <div style="display:flex; align-items:center"><h2>Presets</h2><div class="spacer"></div>
+            <button class="ghost" id="new-preset">New</button></div>
+          <table><tbody id="preset-rows"></tbody></table>
+          <div id="presets-empty" class="muted hidden" style="padding:10px">No presets saved.</div>
+          <div class="subhead">Import config file</div>
+          <div class="row">
+            <input id="import-path" placeholder="icewall.yaml" value="icewall.yaml" style="flex:2" />
+            <button class="ghost" id="import-btn" style="flex:0 0 auto">Import</button>
+          </div>
+          <div class="muted" style="font-size:12px; margin-top:6px">Turns an existing <code>icewall.yaml</code> (server-side path) into a preset. Inline API keys are copied into the preset file.</div>
+        </div>
+        <div class="panel">
+          <h2 id="pe-title">Edit preset</h2>
+          <div class="field"><label>Name</label><input id="pe-name" /></div>
+          <div class="field"><label>Description</label><input id="pe-desc" /></div>
+          <div id="pe-form"></div>
+          <div class="row" style="margin-top:12px">
+            <button class="primary" id="pe-save" style="flex:0 0 auto">Save preset</button>
+            <button class="danger ghost" id="pe-delete" style="flex:0 0 auto">Delete</button>
+            <div class="spacer"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="agent-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="am-title">Agent</h2>
+        <span id="am-stats" class="muted"></span>
+        <div class="spacer"></div>
+        <button class="ghost" id="am-close">✕ Close</button>
+      </div>
+      <div id="am-log" class="agent-log"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

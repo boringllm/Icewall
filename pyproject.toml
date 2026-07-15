@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icewall"
+version = "0.1.0"
+description = "LLM-driven multi-agent scanner that audits large repos for vulnerabilities and proposes remediation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Icewall" }]
+dependencies = [
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=0.7",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
+ui = ["fastapi>=0.110", "uvicorn>=0.27"]
+all = ["anthropic>=0.40", "openai>=1.40", "fastapi>=0.110", "uvicorn>=0.27"]
+
+[project.scripts]
+icewall = "icewall.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["icewall*"]
+
+[tool.setuptools.package-data]
+"icewall.skills" = ["library/**/*.md"]
+"icewall.ui" = ["static/*", "static/vendor/*"]

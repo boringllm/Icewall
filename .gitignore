@@ -1,0 +1,43 @@
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ---- Tests & coverage ------------------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# ---- Claude / Claude Code artifacts ----------------------------------------
+# Local agent state, session transcripts, memory and scratch files.
+.claude/
+CLAUDE.local.md
+*.claude-scratch
+.anthropic/
+
+# ---- Icewall local config & generated output -------------------------------
+# Local config may hold endpoint URLs or inline API keys — never commit it.
+icewall.yaml
+*.sarif
+report.*
+*_scan.json
+
+# Per-session workshop folders (reports, session metadata, agent memory, traces).
+.icewall/
+
+# ---- Editor / OS -----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

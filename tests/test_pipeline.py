@@ -75,6 +75,70 @@ def test_graph_no_phantom_duplicate_symbols():
     assert len(starts) == len(set(starts))
 
 
+# --- import edges -------------------------------------------------------------
+
+def test_graph_import_edges_resolve_cross_file():
+    # app.py does `from utils import run_report, safe_lookup`.
+    g = build_graph(SAMPLE)
+    assert g.stats()["import_edges"] >= 2
+    imported = {s.name for s in g.imported_symbols("app.py")}
+    assert {"run_report", "safe_lookup"} <= imported
+    # The edge is queryable in reverse: which files import a definition.
+    rr = g.find("run_report")[0]
+    assert "app.py" in g.importing_files(rr.id)
+    # Resolution recorded the target file on the Import record.
+    utils_imp = [i for i in g.imports("app.py") if "run_report" in i.names]
+    assert utils_imp and utils_imp[0].target_file == "utils.py"
+
+
+def test_graph_import_edges_ignore_external_modules(tmp_path):
+    # stdlib / third-party imports don't resolve to repo files (no edge).
+    (tmp_path / "m.py").write_text("import os\nfrom flask import Flask\n", encoding="utf-8")
+    g = build_graph(str(tmp_path))
+    assert g.stats()["import_edges"] == 0
+    assert g.imported_symbols("m.py") == []
+
+
+# --- inherit edges ------------------------------------------------------------
+
+def test_graph_inherit_edges_cross_file_python(tmp_path):
+    (tmp_path / "base.py").write_text(
+        "class Handler:\n    def handle(self, x):\n        return x\n", encoding="utf-8"
+    )
+    (tmp_path / "app.py").write_text(
+        "from base import Handler\n\n"
+        "class AdminHandler(Handler):\n    def go(self, x):\n        return self.handle(x)\n",
+        encoding="utf-8",
+    )
+    g = build_graph(str(tmp_path))
+    assert g.stats()["inherit_edges"] >= 1
+    admin = g.find("AdminHandler")[0]
+    assert "Handler" in {s.name for s in g.bases(admin.id)}
+    handler = g.find("Handler")[0]
+    assert "AdminHandler" in {s.name for s in g.subclasses(handler.id)}
+    # A subclass's neighborhood surfaces its base, so inherited taint is visible.
+    assert "Handler" in {s.name for s in g.neighborhood(admin.id, depth=1)}
+
+
+def test_graph_inherit_edges_js_ts_extends(tmp_path):
+    (tmp_path / "a.js").write_text("class A {}\nclass B extends A { m(){} }\n", encoding="utf-8")
+    # IFace is a real class so, if `implements` were wrongly treated as
+    # inheritance, an edge to it would actually resolve — making the exclusion
+    # below a meaningful check rather than a no-op.
+    (tmp_path / "c.ts").write_text(
+        "class IFace {}\nclass Base {}\n"
+        "class Impl extends Base<T> implements IFace { m(){} }\n",
+        encoding="utf-8",
+    )
+    g = build_graph(str(tmp_path))
+    b = g.find("B")[0]
+    assert "A" in {s.name for s in g.bases(b.id)}
+    impl = g.find("Impl")[0]
+    # `extends Base` is an inherit edge; `implements IFace` is not.
+    bases = {s.name for s in g.bases(impl.id)}
+    assert "Base" in bases and "IFace" not in bases
+
+
 # --- engine end-to-end (mock provider) ---------------------------------------
 
 @pytest.fixture(scope="module")

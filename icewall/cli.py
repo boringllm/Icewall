@@ -74,7 +74,8 @@ class _ProgressReporter:
     }
     MILESTONES = {
         "graph_start": "Building code graph",
-        "graph_done": "Graph: {files} files, {symbols} symbols, {call_edges} edges",
+        "graph_done": "Graph: {files} files, {symbols} symbols, "
+        "{call_edges} call / {inherit_edges} inherit / {import_edges} import edges",
         "triage_start": "Triaging {candidates} candidate symbols",
         "triage_done": "Entry points: {entry_points}",
         "trace_done": "Traced {candidate_paths} source->sink paths",

@@ -15,6 +15,11 @@ class LanguageSpec:
     import_nodes: frozenset[str]
     # Field name holding the declared name on function/class nodes (best-effort).
     name_field: str = "name"
+    # How to find base classes on a class node, for inherit edges. Python exposes
+    # them via a node field (`superclasses`); JS/TS hang them off a child node
+    # (`class_heritage`). One or the other is set per language.
+    superclass_field: str | None = None
+    heritage_nodes: frozenset[str] = frozenset()
 
 
 PYTHON = LanguageSpec(
@@ -24,6 +29,7 @@ PYTHON = LanguageSpec(
     class_nodes=frozenset({"class_definition"}),
     call_nodes=frozenset({"call"}),
     import_nodes=frozenset({"import_statement", "import_from_statement"}),
+    superclass_field="superclasses",
 )
 
 _JS_FUNC = frozenset(
@@ -40,6 +46,8 @@ _JS_CLASS = frozenset({"class_declaration", "class"})
 _JS_CALL = frozenset({"call_expression"})
 _JS_IMPORT = frozenset({"import_statement", "import_declaration"})
 
+_JS_HERITAGE = frozenset({"class_heritage"})
+
 JAVASCRIPT = LanguageSpec(
     name="javascript",
     extensions=(".js", ".jsx", ".mjs", ".cjs"),
@@ -47,6 +55,7 @@ JAVASCRIPT = LanguageSpec(
     class_nodes=_JS_CLASS,
     call_nodes=_JS_CALL,
     import_nodes=_JS_IMPORT,
+    heritage_nodes=_JS_HERITAGE,
 )
 
 TYPESCRIPT = LanguageSpec(
@@ -56,6 +65,7 @@ TYPESCRIPT = LanguageSpec(
     class_nodes=_JS_CLASS,
     call_nodes=_JS_CALL,
     import_nodes=_JS_IMPORT,
+    heritage_nodes=_JS_HERITAGE,
 )
 
 TSX = LanguageSpec(
@@ -65,6 +75,7 @@ TSX = LanguageSpec(
     class_nodes=_JS_CLASS,
     call_nodes=_JS_CALL,
     import_nodes=_JS_IMPORT,
+    heritage_nodes=_JS_HERITAGE,
 )
 
 _ALL = (PYTHON, JAVASCRIPT, TYPESCRIPT, TSX)

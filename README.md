@@ -283,9 +283,19 @@ icewall skills --role analyzer
 
 The code graph is Icewall's map of the repository, and every LLM decision is
 anchored to it. tree-sitter parses each file **without compiling or installing
-anything**, extracting one **symbol** per function/method and a **call edge**
-wherever one symbol names another. That graph is what lets the agents follow a
-tainted value *across files* instead of guessing from a single snippet.
+anything**, extracting one **symbol** per function / method / class and three
+kinds of edge between them:
+
+| Edge | Meaning | Example |
+|---|---|---|
+| **call** | one symbol invokes another | `ping()` → `run_report()` |
+| **import** | a file pulls in a definition from another module | `app.py` → `run_report` (from `utils`) |
+| **inherit** | a class extends another class | `AdminHandler` → `Handler` |
+
+That graph is what lets the agents follow a tainted value *across files* — through
+a call, an import, or an inherited method — instead of guessing from a single
+snippet. (The heterogeneous call/import/inherit schema follows the graph design
+of *LocAgent*, arXiv:2503.09089.)
 
 ### Inspect it directly (no LLM, no keys)
 
@@ -294,7 +304,8 @@ icewall graph examples/vulnerable_app
 ```
 
 ```
-{'files': 3, 'symbols': 11, 'functions': 11, 'call_edges': 2}
+{'files': 3, 'symbols': 11, 'functions': 11,
+ 'call_edges': 2, 'inherit_edges': 0, 'import_edges': 2}
                                     Symbols
 +-----------------------------------------------------------------------------+
 | Kind     | Location     | Qualname                | Calls                   |
@@ -309,6 +320,10 @@ icewall graph examples/vulnerable_app
 | ...      |              |                         |                         |
 +-----------------------------------------------------------------------------+
 ```
+
+The two `import_edges` here are `app.py`'s `from utils import run_report,
+safe_lookup` — each resolved to the actual definition in `utils.py`, not merely
+guessed by name.
 
 ### A worked example: a cross-file command injection
 
@@ -339,6 +354,48 @@ A user-controlled value enters in `app.py` but reaches `os.system` in
 The graph is what makes step 3 possible without dumping the whole repo into the
 model: the tracer pulls in **only** the one function it needs, following an edge.
 
+### Import edges — precise cross-file resolution
+
+Call edges alone link a name to *every* symbol declared with that name (cheap,
+but over-approximate). **Import edges** add precision: Icewall parses each file's
+`import` / `from … import` (Python) and `import … from '…'` (JS/TS) statements,
+resolves the module string to the actual file in the repo, and records an edge
+from the importing file to the definitions it pulls in.
+
+```python
+from icewall.graph import build_graph
+g = build_graph("examples/vulnerable_app")
+
+g.imported_symbols("app.py")      # → [run_report, safe_lookup]  (the real defs in utils.py)
+g.importing_files(run_report.id)  # → ['app.py']                 (reverse edge)
+g.imports("app.py")[0].target_file # → 'utils.py'                (module resolved to a file)
+```
+
+External modules (stdlib `os`, third-party `flask`) don't resolve to a repo file,
+so they produce no edge — the graph stays focused on *your* code. Relative imports
+(`from .helpers import x`, `import './utils.js'`) are resolved against the
+importing file's directory, including `__init__.py` / `index.js` package entry
+points.
+
+### Inherit edges — following taint through class hierarchies
+
+**Inherit edges** connect a subclass to the class it extends, so taint that flows
+through an inherited or overridden method is no longer invisible:
+
+```python
+# base.py:   class Handler:      def handle(self, x): ...
+# app.py:    class AdminHandler(Handler):  ...        (imports Handler)
+
+g.bases(admin.id)         # → [Handler]        (Python bases, resolved across files)
+g.subclasses(handler.id)  # → [AdminHandler]   (reverse edge)
+```
+
+They're extracted for Python (`class Foo(Base)`) and JS/TS (`class Foo extends
+Base`) alike; TypeScript `implements` clauses are deliberately **not** treated as
+inheritance. Crucially, `neighborhood()` now follows inherit edges by default, so
+when the tracer inspects a subclass or an overriding method, the base class it
+extends is pulled into context automatically.
+
 ### How the graph is rendered in the UI
 
 During a scan the same graph is streamed to the browser (`graph_data` events) and
@@ -350,19 +407,24 @@ drawn with a locally-vendored Cytoscape.js — **no CDN, works fully offline**.
 - 🟢 **source** — the symbol reads untrusted input (`request.args`, `req.query`, …)
 - 🔵 **function** — everything else
 
-Edges are call relationships; large repos are capped to the most-connected,
-most taint-relevant symbols (`cap`, default 300) so the view stays legible, and
-the saved `graph.json` in each session lets you re-open the exact graph later
-from the session dashboard.
+Edges carry a `kind` (`call` or `inherit`) so the two symbol-to-symbol relations
+are distinguishable; import edges (which point from a file, not a symbol) are
+summarized in the payload's `import_edges` count. Large repos are capped to the
+most-connected, most taint-relevant symbols (`cap`, default 300) so the view
+stays legible, and the saved `graph.json` in each session lets you re-open the
+exact graph later from the session dashboard.
 
 ### Can the graph cause a missed vulnerability?
 
-Yes, in principle — that's why scan **intensity** exists. Two graph limits matter:
+Yes, in principle — that's why scan **intensity** exists, and why the graph
+carries import and inherit edges. Two graph limits matter:
 
 - **Name-based edge resolution is over-approximate but can also under-connect.**
   A call made purely through a dynamic dispatch (a value looked up at runtime,
   reflection, a callback stored in a dict) may leave no static edge, so the
-  tracer won't follow it.
+  tracer won't follow it. **Import edges** shrink this gap for cross-file calls
+  by tying a name to the specific module it came from, and **inherit edges**
+  recover taint that flows through an inherited/overridden method.
 - **The source/sink pre-filter can skip a function** whose sink Icewall doesn't
   recognize as a pattern (a custom wrapper around a dangerous call).
 
@@ -374,7 +436,9 @@ confirm real reachability rather than trusting the edge blindly.
 ## Languages
 
 Python, JavaScript, TypeScript (incl. TSX) via tree-sitter. Adding a language is
-a `LanguageSpec` in `icewall/graph/languages.py`.
+a `LanguageSpec` in `icewall/graph/languages.py` — declaring its function, class,
+call, and import node types, plus how it spells inheritance (`superclass_field`
+for Python, `heritage_nodes` for the `extends`-style grammars).
 
 ## External scanners
 
@@ -387,7 +451,7 @@ additive and never a hard dependency.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q     # 71 offline tests, no API keys
+python -m pytest tests/ -q     # 75 offline tests, no API keys
 ```
 
 ## Project layout
@@ -413,8 +477,11 @@ tests/
 
 ## Caveats
 
-- Name-based call resolution is over-approximate (guides context; the LLM
-  confirms reachability). No cross-module type resolution yet.
+- Name-based *call* resolution is over-approximate (guides context; the LLM
+  confirms reachability). *Import* edges are resolved more precisely — the module
+  string is mapped to the actual repo file — but there's still no full
+  cross-module type resolution, so a name imported through a package re-export or
+  a dynamically-built path may not resolve.
 - Remediations are **proposals for human review**, never auto-applied.
 - The mock provider is a crude pattern-matcher for offline/dev/testing — real
   precision comes from configuring real models.

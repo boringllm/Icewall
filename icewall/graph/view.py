@@ -46,6 +46,7 @@ def graph_view(graph: CodeGraph, cap: int = 300) -> dict:
                 "has_source": bool(src),
                 "has_sink": bool(sinks),
                 "sink_kinds": sorted({m for _, m in sinks})[:4],
+                "bases": [b.name for b in graph.bases(s.id)],
             }
         )
 
@@ -54,11 +55,19 @@ def graph_view(graph: CodeGraph, cap: int = 300) -> dict:
     for s in kept:
         for c in graph.callees(s.id):
             if c.id in kept_ids:
-                key = (s.id, c.id)
+                key = (s.id, c.id, "call")
                 if key not in seen:
                     seen.add(key)
-                    edges.append({"source": s.id, "target": c.id})
+                    edges.append({"source": s.id, "target": c.id, "kind": "call"})
+        # Inherit edges (subclass -> superclass) are symbol-to-symbol too.
+        for b in graph.bases(s.id):
+            if b.id in kept_ids:
+                key = (s.id, b.id, "inherit")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"source": s.id, "target": b.id, "kind": "inherit"})
 
+    st = graph.stats()
     return {
         "nodes": nodes,
         "edges": edges,
@@ -66,4 +75,6 @@ def graph_view(graph: CodeGraph, cap: int = 300) -> dict:
         "total_symbols": len(syms),
         "shown": len(nodes),
         "capped": len(syms) > cap,
+        "inherit_edges": st["inherit_edges"],
+        "import_edges": st["import_edges"],
     }

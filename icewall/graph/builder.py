@@ -78,12 +78,14 @@ def build_graph(
         except OSError:
             continue
         try:
-            symbols = parse_source(rel, source, spec)
+            parsed = parse_source(rel, source, spec)
         except Exception:
             # A single malformed file must not abort the whole scan.
             continue
-        for sym in symbols:
+        for sym in parsed.symbols:
             graph.add_symbol(sym)
+        if parsed.imports:
+            graph.add_file_imports(rel, parsed.imports)
         if on_file:
             on_file(rel)
 

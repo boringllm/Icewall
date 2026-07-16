@@ -26,6 +26,19 @@ CLAUDE.local.md
 *.claude-scratch
 .anthropic/
 
+# ---- Secrets & credentials -------------------------------------------------
+# Never commit keys/tokens. Keep an .env.example checked in instead.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
+secrets.*
+*.credentials.json
+
 # ---- Icewall local config & generated output -------------------------------
 # Local config may hold endpoint URLs or inline API keys — never commit it.
 icewall.yaml
@@ -35,6 +48,18 @@ report.*
 
 # Per-session workshop folders (reports, session metadata, agent memory, traces).
 .icewall/
+
+# ---- Knowledge base (Vul-RAG) runtime data ---------------------------------
+# Generated locally: distilled items, embedding config, and endpoint presets
+# (which may hold INLINE API KEYS), plus large OSV caches / CVEfixes datasets.
+# All runtime data — never commit it.
+kb/
+_osv_cache/
+CVEfixes*.db
+*.sql.gz
+*.db-journal
+*.db-wal
+*.db-shm
 
 # ---- Editor / OS -----------------------------------------------------------
 .vscode/

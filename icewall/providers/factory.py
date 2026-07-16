@@ -19,6 +19,8 @@ def _cache_key(cfg: ProviderConfig) -> tuple:
         cfg.api_key,
         tuple(sorted(cfg.extra_headers.items())),
         cfg.verify_ssl,
+        cfg.timeout,
+        cfg.max_retries,
     )
 
 
@@ -40,6 +42,8 @@ def build_provider(cfg: ProviderConfig) -> LLMProvider:
             extra_headers=cfg.extra_headers,
             api_key=cfg.api_key,
             verify_ssl=cfg.verify_ssl,
+            timeout=cfg.timeout,
+            max_retries=cfg.max_retries,
         )
     elif cfg.type == ProviderType.OPENAI:
         from icewall.providers.openai_provider import OpenAICompatProvider
@@ -50,6 +54,8 @@ def build_provider(cfg: ProviderConfig) -> LLMProvider:
             extra_headers=cfg.extra_headers,
             api_key=cfg.api_key,
             verify_ssl=cfg.verify_ssl,
+            timeout=cfg.timeout,
+            max_retries=cfg.max_retries,
         )
     else:  # pragma: no cover
         raise ValueError(f"Unknown provider type: {cfg.type}")

@@ -95,6 +95,21 @@ class Engine:
             max_chars=config.trace.max_chars,
         )
         self.agents = self._build_agents()
+        # Optional knowledge base (Vul-RAG): retrieved per finding and fed to the
+        # validator. None when disabled or empty, so validation is unchanged then.
+        self.knowledge = self._build_knowledge()
+
+    def _build_knowledge(self):
+        kc = self.cfg.knowledge
+        if not kc.enabled:
+            return None
+        try:
+            from icewall.knowledge import KnowledgeStore, build_embedder
+
+            store = KnowledgeStore(kc, embedder=build_embedder(kc.embedding))
+            return store if store.items else None
+        except Exception:
+            return None
 
     def _build_agents(self) -> dict:
         self.skill_registry = SkillRegistry.discover(self.cfg.skills)
@@ -631,11 +646,31 @@ class Engine:
                 payload["prior_notes"] = [
                     {"title": n.title, "role": n.role, "body": n.body} for n in prior
                 ]
+        # Knowledge-level RAG: retrieve CVE-derived items for this class and feed
+        # them to the validator, which checks "cause present AND fix absent".
+        knowledge_block = None
+        if self.knowledge is not None:
+            items = self.knowledge.retrieve(
+                finding.vuln_class.value,
+                [code, finding.description or "", finding.title],
+            )
+            if items:
+                knowledge_block = [
+                    {
+                        "cause": it.abstract_cause or it.detailed_cause,
+                        "fix": it.fixing_solution,
+                        "source": it.source,
+                    }
+                    for it in items
+                ]
+                finding.knowledge_refs = [it.source for it in items]
         label = f"Validating {finding.title}"
         subj = finding.location.file
         self._agent("validator", "start", label, subject=subj)
         try:
-            result = agent.validate(payload, code, [s.symbol for s in finding.call_chain])
+            result = agent.validate(
+                payload, code, [s.symbol for s in finding.call_chain], knowledge=knowledge_block
+            )
         except BudgetExceeded:
             self._agent("validator", "end", label, subject=subj, outcome="budget exceeded (kept)")
             return finding  # fail-open: keep unvalidated rather than lose it

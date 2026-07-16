@@ -19,6 +19,8 @@ class OpenAICompatProvider(LLMProvider):
         extra_headers: Optional[dict] = None,
         api_key: Optional[str] = None,
         verify_ssl: bool = True,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ):
         try:
             import openai  # noqa: F401
@@ -36,11 +38,15 @@ class OpenAICompatProvider(LLMProvider):
             kwargs["base_url"] = base_url
         if extra_headers:
             kwargs["default_headers"] = extra_headers
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
         if not verify_ssl:
             # Skip TLS verification (self-signed / MITM proxies). Insecure.
             import httpx
 
-            kwargs["http_client"] = httpx.Client(verify=False)
+            kwargs["http_client"] = httpx.Client(verify=False, timeout=timeout)
         self._client = openai.OpenAI(**kwargs)
 
     def complete(

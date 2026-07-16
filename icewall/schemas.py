@@ -107,6 +107,8 @@ class Finding(BaseModel):
     verdict: Optional[Verdict] = None
     validated: bool = False
     validation_notes: Optional[str] = None
+    # Knowledge-base items (by source id, e.g. CVE) the validator was shown.
+    knowledge_refs: list[str] = Field(default_factory=list)
 
     # Populated by the remediation agent.
     remediation: Optional[Remediation] = None

@@ -15,6 +15,8 @@
       <button data-view="scan" class="active">Scan</button>
       <button data-view="sessions">Sessions</button>
       <button data-view="presets">Presets</button>
+      <button data-view="knowledge">Knowledge</button>
+      <button data-view="build">Build KB</button>
     </nav>
     <div class="spacer"></div>
     <div class="version" id="version">connecting…</div>
@@ -40,6 +42,10 @@
           <div class="field check">
             <input type="checkbox" id="dry-run" />
             <label for="dry-run" style="margin:0">Dry run — offline mock provider, no API keys, free</label>
+          </div>
+          <div class="field check">
+            <input type="checkbox" id="use-knowledge" />
+            <label for="use-knowledge" style="margin:0">Use knowledge base (Vul-RAG) — retrieve CVE knowledge to sharpen validation <span class="muted" id="kb-toggle-hint" style="text-transform:none"></span></label>
           </div>
           <div class="field">
             <label>Scan intensity <span class="muted" style="text-transform:none">— recall vs cost</span></label>
@@ -188,6 +194,226 @@
             <div class="spacer"></div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- ================= BUILD KB ================= -->
+    <section class="view" id="view-build">
+      <div class="panel">
+        <div style="display:flex; align-items:center; gap:10px">
+          <h2 style="margin:0">Build knowledge base</h2><div class="spacer"></div>
+          <span class="muted" id="kb-build-hint" style="font-size:12px"></span>
+        </div>
+        <div class="muted" style="font-size:12px; margin:6px 0 14px">
+          Distill real CVE fix commits into vulnerability knowledge (cause + fix), stored and
+          retrieved to sharpen the validator.
+        </div>
+
+        <!-- sub-tabs: show one part at a time -->
+        <div class="segmented kb-tabs" id="kb-tabs">
+          <button class="seg active" data-kbtab="endpoints"><b>1</b> Endpoints</button>
+          <button class="seg" data-kbtab="cves"><b>2</b> Build from CVEs</button>
+          <button class="seg" data-kbtab="import"><b>3</b> Import from dataset</button>
+        </div>
+
+        <!-- ===== Endpoints ===== -->
+        <div class="kb-tabpane" id="kbtab-endpoints">
+          <div class="kb-panehead">Endpoints <span class="muted">— distiller &amp; embedding services, shared by both build methods</span></div>
+          <div class="kb-eppreset">
+            <select id="kb-ep-preset"><option value="">— saved endpoint presets —</option></select>
+            <button class="ghost" id="kb-ep-load">Load</button>
+            <input id="kb-ep-name" placeholder="preset name" />
+            <button class="ghost" id="kb-ep-save">Save</button>
+            <button class="danger ghost" id="kb-ep-del">Delete</button>
+            <span class="muted" style="flex-basis:100%; font-size:11px">Saves the distiller &amp; embedding settings below. Inline API keys are stored in plaintext under <code>kb/</code>; prefer an env-var name.</span>
+          </div>
+          <div class="kb-cols2">
+            <div class="kb-col">
+            <div class="kb-sub">Distiller LLM (cheap, OpenAI-compatible)</div>
+            <div class="row">
+              <div class="field" style="flex:0 0 130px"><label>Provider</label>
+                <select id="kb-dist-type"><option value="openai">openai</option><option value="anthropic">anthropic</option><option value="mock">mock (offline)</option></select>
+              </div>
+              <div class="field" style="flex:2"><label>Base URL</label><input id="kb-dist-baseurl" placeholder="https://api.example.com/v1" /></div>
+              <div class="field" style="flex:1"><label>Model</label><input id="kb-dist-model" placeholder="cheap-model" /></div>
+            </div>
+            <div class="row">
+              <div class="field" style="flex:2"><label>API key (inline)</label><input id="kb-dist-key" placeholder="sk-…" /></div>
+              <div class="field" style="flex:2"><label>or API key env var</label><input id="kb-dist-keyenv" placeholder="OPENAI_API_KEY" /></div>
+              <div class="field" style="flex:1"><label>Timeout (s)</label><input id="kb-dist-timeout" type="number" placeholder="120" /></div>
+              <div class="field" style="flex:1"><label>Max retries</label><input id="kb-dist-retries" type="number" placeholder="1" /></div>
+            </div>
+            <div class="row baseline">
+              <div class="field check"><input type="checkbox" id="kb-dist-ssl" checked /><label for="kb-dist-ssl">Verify SSL certificate</label></div>
+              <div class="spacer"></div>
+              <button class="ghost" id="kb-test-llm" style="flex:0 0 auto">Test connection</button>
+            </div>
+            <div class="muted kb-test-status" id="kb-test-llm-status"></div>
+            </div><!-- /distiller col -->
+            <div class="kb-col">
+            <div class="kb-sub">Embedding endpoint (OpenAI-compatible)</div>
+            <div class="muted" style="font-size:11.5px; margin:-4px 0 8px">Leave the model blank to skip embeddings and use the local BM25 fallback.</div>
+            <div class="row">
+              <div class="field" style="flex:2"><label>Base URL</label><input id="kb-emb-baseurl" placeholder="https://api.openai.com/v1" /></div>
+              <div class="field" style="flex:1"><label>Model</label><input id="kb-emb-model" placeholder="text-embedding-3-small" /></div>
+            </div>
+            <div class="row">
+              <div class="field" style="flex:2"><label>API key (inline)</label><input id="kb-emb-key" placeholder="sk-…" /></div>
+              <div class="field" style="flex:2"><label>or API key env var</label><input id="kb-emb-keyenv" placeholder="OPENAI_API_KEY" /></div>
+            </div>
+            <div class="row">
+              <div class="field"><label>Dimensions</label><input id="kb-emb-dims" type="number" placeholder="optional" /></div>
+              <div class="field"><label>Timeout (s)</label><input id="kb-emb-timeout" type="number" placeholder="30" /></div>
+              <div class="field"><label>Max retries</label><input id="kb-emb-retries" type="number" placeholder="2" /></div>
+            </div>
+            <div class="row baseline">
+              <div class="field check"><input type="checkbox" id="kb-emb-ssl" checked /><label for="kb-emb-ssl">Verify SSL certificate</label></div>
+              <div class="spacer"></div>
+              <button class="ghost" id="kb-test-emb" style="flex:0 0 auto">Test connection</button>
+            </div>
+            <div class="muted kb-test-status" id="kb-test-emb-status"></div>
+            </div><!-- /embedding col -->
+          </div><!-- /kb-cols2 -->
+        </div><!-- /kbtab-endpoints -->
+
+        <!-- ===== Build from CVEs ===== -->
+        <div class="kb-tabpane hidden" id="kbtab-cves">
+          <div class="kb-panehead">Build from CVEs <span class="muted">— fetches each fix commit from GitHub, then distills it</span></div>
+          <div class="kb-cols2">
+            <div class="kb-col">
+            <div class="field" style="margin-top:0">
+              <label>CVE ids (one per line)</label>
+              <textarea id="kb-cves" rows="4" placeholder="CVE-2023-1234&#10;CVE-2022-5678"></textarea>
+            </div>
+            <div class="row baseline">
+              <div class="field" style="flex:0 0 200px"><label>Items injected per finding (top_k)</label><input id="kb-topk" type="number" value="6" /></div>
+              <div class="spacer"></div>
+              <div class="field check"><input type="checkbox" id="kb-fetch-ssl" checked /><label for="kb-fetch-ssl">Verify SSL (GitHub fetch)</label></div>
+            </div>
+            <div class="field check"><input type="checkbox" id="kb-skip-existing" checked /><label for="kb-skip-existing">Skip CVEs already in the knowledge base (dedup)</label></div>
+            <div class="row" style="margin-top:8px">
+              <button class="primary" id="kb-build" style="flex:2">Build from CVEs</button>
+              <button class="ghost" id="kb-seed" style="flex:0 0 auto" title="Populate from Icewall's bundled per-CWE skills — no network">Seed from skills</button>
+              <button class="danger ghost" id="kb-clear" style="flex:0 0 auto">Clear all</button>
+            </div>
+            </div><!-- /form col -->
+            <div class="kb-col">
+              <div class="kb-info">
+                <b>How this works</b>
+                <p>Each CVE id is looked up on OSV, its GitHub fix commit(s) fetched (<code>api.github.com</code> + <code>raw.githubusercontent.com</code>), the changed functions extracted, and each distilled into knowledge.</p>
+                <p><b>Needs network access to GitHub.</b> A token (set via config) raises the rate limit. Best for a handful of specific CVEs — for bulk, use the <b>Import from dataset</b> tab.</p>
+                <p><b>Seed from skills</b> populates the base from Icewall's bundled per-CWE skills with no network — a good first run.</p>
+              </div>
+            </div>
+          </div><!-- /kb-cols2 -->
+        </div><!-- /kbtab-cves -->
+
+        <!-- ===== Import from dataset ===== -->
+        <div class="kb-tabpane hidden" id="kbtab-import">
+          <div class="kb-panehead">Import from a dataset <span class="muted">— bulk-build from a downloaded corpus</span></div>
+          <div class="kb-cols2">
+            <div class="kb-col">
+            <div class="field"><label>Dataset</label>
+              <select id="kb-imp-source">
+                <option value="cvefixes">CVEfixes (SQLite — offline, no GitHub)</option>
+                <option value="osv">OSV ecosystem dumps (needs GitHub)</option>
+              </select>
+            </div>
+            <div class="field" id="kb-imp-cvefixes">
+              <label>CVEfixes dataset folder (or a .db)</label>
+              <input id="kb-imp-db" placeholder="…/CVEfixes_v1.0.8/CVEfixes_v1.0.8" />
+              <div class="muted" style="font-size:11px; margin-top:4px">Point at the dataset folder — Icewall finds the <code>.sql.gz</code>, converts it to SQLite (once), then imports.</div>
+            </div>
+            <div class="field hidden" id="kb-imp-osv">
+              <label>OSV ecosystems</label>
+              <div class="row" style="gap:14px">
+                <label class="inline-check"><input type="checkbox" class="kb-eco" value="PyPI" checked /> PyPI (Python)</label>
+                <label class="inline-check"><input type="checkbox" class="kb-eco" value="npm" checked /> npm (JS/TS)</label>
+              </div>
+              <label class="inline-check" style="margin-top:8px"><input type="checkbox" id="kb-osv-ssl" checked /> Verify SSL when fetching from GitHub</label>
+            </div>
+            <div class="field">
+              <label>Languages</label>
+              <div class="row" style="gap:14px">
+                <label class="inline-check"><input type="checkbox" class="kb-lang" value="python" checked /> Python</label>
+                <label class="inline-check"><input type="checkbox" class="kb-lang" value="javascript" checked /> JavaScript</label>
+                <label class="inline-check"><input type="checkbox" class="kb-lang" value="typescript" checked /> TypeScript</label>
+              </div>
+            </div>
+            <div class="row baseline">
+              <div class="field" style="flex:0 0 160px"><label>Limit (max items)</label><input id="kb-imp-limit" type="number" value="500" /></div>
+              <div class="spacer"></div>
+              <div class="field check"><input type="checkbox" id="kb-imp-cwe" checked /><label for="kb-imp-cwe">Injection CWEs only</label></div>
+            </div>
+            <div class="field check"><input type="checkbox" id="kb-imp-skip" checked /><label for="kb-imp-skip">Skip items already in the knowledge base (dedup)</label></div>
+            <button class="primary" id="kb-import" style="width:100%; margin-top:4px">Import from dataset</button>
+            </div><!-- /form col -->
+            <div class="kb-col">
+              <div class="kb-info">
+                <b>Which dataset?</b>
+                <p><b>CVEfixes</b> — a downloaded SQLite corpus that bundles the vulnerable &amp; patched code, so it needs <b>no GitHub</b>. Point Icewall at the dataset folder; it converts the <code>.sql.gz</code> to SQLite once, then imports.</p>
+                <p><b>OSV</b> — per-ecosystem dumps that only reference fix commits, so this path <b>fetches code from GitHub</b>.</p>
+                <p>Uses the distiller &amp; embedding from the <b>Endpoints</b> tab. The <b>limit</b> and <b>Injection CWEs only</b> filter keep cost bounded.</p>
+              </div>
+            </div>
+          </div><!-- /kb-cols2 -->
+        </div><!-- /kbtab-import -->
+
+        <!-- ===== shared build output ===== -->
+        <div class="kb-run">
+          <h3 style="margin-top:0">Build output</h3>
+          <div class="progress-wrap" id="kb-prog-wrap" style="display:none; margin-bottom:8px">
+            <div class="bar"><i id="kb-prog"></i></div>
+            <div class="progress-meta"><span id="kb-prog-label">Starting…</span><span id="kb-prog-pct">0%</span></div>
+          </div>
+          <div class="log" id="kb-log"><div class="muted">Idle. Configure the <b>Endpoints</b> tab, then <b>Build from CVEs</b> or <b>Import from dataset</b>. <b>Seed from skills</b> works offline.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= KNOWLEDGE BASE ================= -->
+    <section class="view" id="view-knowledge">
+      <div class="panel kb-contents">
+        <div style="display:flex; align-items:center">
+          <h2 style="margin:0">Knowledge base</h2><div class="spacer"></div>
+          <button class="ghost" id="kb-refresh">Refresh</button>
+        </div>
+          <div class="stat-tiles" style="margin-top:12px">
+            <div class="tile"><div class="k">Items</div><div class="v" id="kb-count">–</div></div>
+            <div class="tile"><div class="k">Embedded</div><div class="v" id="kb-embedded">–</div></div>
+            <div class="tile"><div class="k">Retrieval</div><div class="v" id="kb-mode" style="font-size:14px">–</div></div>
+          </div>
+          <div class="legend" id="kb-classes" style="margin-top:10px"></div>
+
+          <div class="subhead">Find &amp; delete</div>
+          <div class="muted" style="font-size:11.5px; margin:-4px 0 8px">
+            Rank items by a query, tick the ones you don't want, and delete them. <b>Embedding</b> matches by
+            meaning (needs an embedded base); <b>BM25</b> matches by keywords (always available).
+          </div>
+          <div class="row">
+            <div class="field" style="flex:2"><input id="kb-search-q" placeholder="e.g. deprecated framework, unrelated topic, test noise…" /></div>
+            <div class="field" style="flex:0 0 130px"><select id="kb-search-mode">
+              <option value="auto">Auto</option>
+              <option value="bm25">BM25</option>
+              <option value="embedding">Embedding</option>
+            </select></div>
+            <button class="ghost" id="kb-search-btn" style="flex:0 0 auto; align-self:end">Search</button>
+          </div>
+          <div id="kb-search-wrap" class="hidden" style="margin-bottom:10px">
+            <div class="kb-results-bar">
+              <label class="inline-check"><input type="checkbox" id="kb-search-all" /> Select all</label>
+              <span class="muted" id="kb-search-meta" style="font-size:11.5px"></span>
+              <div class="spacer"></div>
+              <button class="danger ghost" id="kb-search-del" style="flex:0 0 auto" disabled>Delete selected</button>
+            </div>
+            <div id="kb-search-results" style="max-height:280px; overflow:auto"></div>
+          </div>
+
+          <div class="field" style="margin-top:10px">
+            <label>Filter by class</label>
+            <select id="kb-filter"><option value="">— all —</option></select>
+          </div>
+          <div id="kb-items" style="max-height:520px; overflow:auto"></div>
       </div>
     </section>
   </main>

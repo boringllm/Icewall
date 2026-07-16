@@ -205,3 +205,55 @@ tr.click:hover td { background: var(--panel-2); }
 .md h1 { font-size: 18px; } .md h2 { font-size: 15px; } .md code { background: var(--bg-2); padding: 1px 5px; border-radius: 4px; }
 .notes-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .notes-list button { font-size: 11px; padding: 4px 9px; }
+
+/* ---- knowledge base (Vul-RAG) ---- */
+#kb-items, #kb-search-results { display: block; }
+.kb-item { border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; margin-bottom: 8px; background: var(--bg-2); }
+.kb-item.sel { border-color: var(--accent); background: var(--panel-2); }
+.kb-item-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.kb-item .kb-cb { width: auto; flex: 0 0 auto; cursor: pointer; }   /* not the global full-width input */
+.kb-line { font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.kb-line b { color: var(--muted); font-weight: 600; }
+.kb-results-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+#kb-log .kb-err { color: #ff8fa3; }
+#kb-log .kb-build-head { color: var(--accent); font-weight: 700; }
+.inline-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text); margin: 0; width: auto; }
+.inline-check input { width: auto; }
+
+/* Build view — sub-tabs so only one part shows at a time. */
+.kb-tabs { margin-bottom: 18px; }
+.kb-tabs .seg { padding: 9px 8px; }
+.kb-tabs .seg b { font-weight: 800; margin-right: 6px; opacity: .75; }
+.kb-tabs .seg.active b { opacity: 1; }
+.kb-panehead { font-size: 14px; font-weight: 700; color: var(--text); margin: 2px 0 16px; }
+.kb-panehead .muted { font-weight: 400; font-size: 12px; }
+.kb-eppreset { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;
+  padding: 10px 12px; border: 1px dashed var(--border); border-radius: 9px; background: var(--bg-2); }
+.kb-eppreset select { flex: 1 1 180px; width: auto; }
+.kb-eppreset input { flex: 0 1 160px; width: auto; }
+.kb-eppreset button { flex: 0 0 auto; }
+.kb-tabpane .kb-sub { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 10px; border-bottom: 1px dashed var(--border); padding-bottom: 4px; }
+.kb-tabpane .row { align-items: flex-end; }        /* inputs line up even when labels wrap */
+.kb-tabpane .field { margin-bottom: 10px; }
+.check label { margin: 0; }                        /* no bottom-margin drift beside a checkbox */
+.kb-tabpane .row.baseline { align-items: center; }
+.kb-tabpane .row.baseline .field { margin-bottom: 0; }
+.kb-tabpane .row.baseline .field.check { flex: 0 0 auto; }  /* hug content, sit right of the spacer */
+.kb-test-status { font-size: 11.5px; min-height: 14px; margin: 2px 0 0; }
+
+/* Two-column pane: form beside a guidance panel; collapses on narrow screens. */
+.kb-cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+.kb-col { min-width: 0; }
+.kb-col + .kb-col { border-left: 1px solid var(--border); padding-left: 22px; }
+@media (max-width: 1024px) {
+  .kb-cols2 { grid-template-columns: 1fr; }
+  .kb-col + .kb-col { border-left: none; padding-left: 0; border-top: 1px dashed var(--border); padding-top: 12px; }
+}
+.kb-info { background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+.kb-info b { color: var(--text); }
+.kb-info p { margin: 8px 0 0; }
+.kb-info code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+.kb-run { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 14px; }
+
+/* Contents view is a single panel — keep it a comfortable reading width. */
+.kb-contents { max-width: 1040px; }

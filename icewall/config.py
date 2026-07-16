@@ -51,6 +51,11 @@ class ProviderConfig(BaseModel):
     # Set false to skip TLS certificate verification (self-signed gateways,
     # corporate MITM proxies). Insecure — only for trusted internal endpoints.
     verify_ssl: bool = True
+    # Per-request timeout (seconds) and retry count. None => the SDK default
+    # (which is long — 10 min / 2 retries). Set these to keep a slow or hung
+    # endpoint from blocking a run indefinitely.
+    timeout: Optional[float] = None
+    max_retries: Optional[int] = None
 
 
 class AgentModelConfig(BaseModel):
@@ -136,6 +141,54 @@ class TraceConfig(BaseModel):
     max_chars: int = 16000
 
 
+class EmbeddingConfig(BaseModel):
+    """An OpenAI-compatible embeddings endpoint used for knowledge retrieval.
+    Separate from the chat providers — it may point at a different host/model.
+    Leave `model` empty to disable embeddings and fall back to local BM25."""
+
+    base_url: Optional[str] = None
+    model: str = ""  # e.g. "text-embedding-3-small"; empty => BM25 fallback
+    api_key_env: Optional[str] = None
+    api_key: Optional[str] = None
+    # Optional output dimensionality (endpoints that support truncation).
+    dimensions: Optional[int] = None
+    verify_ssl: bool = True
+    # Per-request timeout (seconds) and retry count for the embeddings endpoint.
+    # `max_retries` None => the SDK default (2). Keep both modest so a slow or
+    # hung embedding host can't stall a build.
+    timeout: float = 30.0
+    max_retries: Optional[int] = None
+
+
+class KnowledgeConfig(BaseModel):
+    """Knowledge-level RAG (Vul-RAG style). A persistent store of vulnerability
+    knowledge distilled from real CVE+patch pairs is retrieved per candidate and
+    fed to the validator, which checks whether the candidate exhibits a known
+    cause while the corresponding fix is absent. Off by default; when on but the
+    store is empty/unreachable, the validator simply runs as it does today."""
+
+    enabled: bool = False
+    # Where the knowledge base lives (JSONL items + build bookkeeping).
+    root: str = "kb"
+    # How many knowledge items to inject into the validator per finding.
+    top_k: int = 6
+    # Drop retrieved items scoring below this (embedding cosine or BM25 score).
+    min_score: float = 0.0
+    # Provider (key into IcewallConfig.providers) the offline build uses to
+    # distill CVE+patch pairs into knowledge. Falls back to the analyzer's.
+    distiller_provider: Optional[str] = None
+    # Model id for the distiller on that provider (falls back to analyzer's).
+    distiller_model: Optional[str] = None
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    # Skip TLS verification when fetching CVE metadata/patches during a build.
+    fetch_verify_ssl: bool = True
+    # Env var holding a GitHub token (raises commit-fetch rate limits). Optional.
+    github_token_env: Optional[str] = None
+    # Default path to a prepared CVEfixes SQLite db (or the dataset dir) for
+    # bulk import. Optional — the CLI/UI can also pass it per invocation.
+    cvefixes_db: Optional[str] = None
+
+
 class ConcurrencyConfig(BaseModel):
     neural_workers: int = 8  # bounded by API rate/cost
     symbolic_workers: int = 8  # CPU-bound graph work
@@ -184,6 +237,7 @@ class IcewallConfig(BaseModel):
     context: ContextConfig = Field(default_factory=ContextConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     # Custom per-model prices (USD / 1M tokens). Overrides the built-in table.
     pricing: dict[str, ModelPrice] = Field(default_factory=dict)
 

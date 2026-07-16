@@ -205,5 +205,32 @@ class MockProvider(LLMProvider):
         summary = "Taint-relevant digest:\n" + "\n".join(lines)
         return {"summary": summary}
 
+    def _role_distiller(self, payload: dict) -> dict:
+        # Offline stand-in for the KB distiller: derive structured knowledge from
+        # the vulnerable/patched code using the shared taint patterns.
+        vuln = payload.get("vulnerable_code", "")
+        patched = payload.get("patched_code", "")
+        sinks = find_sinks(vuln)
+        vc = sinks[0][0] if sinks else None
+        matched = sinks[0][1] if sinks else "a dangerous operation"
+        fixed = ""
+        if vc is not None:
+            if has_sanitizer(patched, vc) and not has_sanitizer(vuln, vc):
+                fixed = f"add a sanitizer/guard for {vc.value} before {matched}"
+            elif not find_sinks(patched, [vc]):
+                fixed = f"remove or replace the unsafe {matched} call"
+            else:
+                fixed = f"constrain the untrusted input reaching {matched}"
+        return {
+            "vuln_class": vc.value if vc else "",
+            "abstract_purpose": "a function that processes external input",
+            "detailed_behavior": (payload.get("description") or "")[:200]
+            or f"passes input toward {matched}",
+            "triggering_action": f"untrusted input reaches {matched}",
+            "abstract_cause": "unsanitized untrusted input reaches a dangerous operation",
+            "detailed_cause": f"input flows into {matched} without adequate validation",
+            "fixing_solution": fixed or "validate/escape untrusted input before the sink",
+        }
+
     def _role_unknown(self, payload: dict) -> dict:
         return {"note": "mock provider: no handler for this role", "echo_keys": list(payload.keys())}

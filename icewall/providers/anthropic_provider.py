@@ -17,6 +17,8 @@ class AnthropicProvider(LLMProvider):
         extra_headers: Optional[dict] = None,
         api_key: Optional[str] = None,
         verify_ssl: bool = True,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ):
         try:
             import anthropic  # noqa: F401
@@ -38,10 +40,14 @@ class AnthropicProvider(LLMProvider):
             kwargs["base_url"] = base_url
         if extra_headers:
             kwargs["default_headers"] = extra_headers
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
         if not verify_ssl:
             import httpx
 
-            kwargs["http_client"] = httpx.Client(verify=False)
+            kwargs["http_client"] = httpx.Client(verify=False, timeout=timeout)
         self._client = anthropic.Anthropic(**kwargs)
 
     def complete(

@@ -373,6 +373,236 @@ def version() -> None:
     print(f"icewall {__version__}")
 
 
+# --- knowledge base (Vul-RAG) -----------------------------------------------
+
+kb_app = typer.Typer(add_completion=False, help="Manage the vulnerability knowledge base (Vul-RAG).")
+app.add_typer(kb_app, name="kb")
+
+
+def _kb_builder(cfg: IcewallConfig, on_progress=None):
+    from icewall.config import AgentRole
+    from icewall.knowledge import build_embedder
+    from icewall.knowledge.builder import KnowledgeBuilder
+    from icewall.providers import build_provider
+
+    kc = cfg.knowledge
+    prov_key = kc.distiller_provider or cfg.agent(AgentRole.ANALYZER).provider
+    model = kc.distiller_model or cfg.agent(AgentRole.ANALYZER).model
+    pcfg = cfg.providers.get(prov_key) or cfg.provider_for(AgentRole.ANALYZER)
+    # Bound distiller requests so a slow/hung endpoint can't stall the import.
+    if pcfg.timeout is None:
+        pcfg = pcfg.model_copy(update={
+            "timeout": 120,
+            "max_retries": 1 if pcfg.max_retries is None else pcfg.max_retries,
+        })
+    return KnowledgeBuilder(
+        kc,
+        provider=build_provider(pcfg),
+        model=model,
+        embedder=build_embedder(kc.embedding),
+        on_progress=on_progress,
+    )
+
+
+@kb_app.command("build")
+def kb_build(
+    cve: list[str] = typer.Option(None, "--cve", help="CVE id to ingest (repeatable)."),
+    cve_file: Optional[str] = typer.Option(None, "--cve-file", help="File with one CVE id per line."),
+    skip_existing: bool = typer.Option(True, "--skip-existing/--no-skip-existing", help="Skip pairs already in the KB (dedup) before distilling."),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Fetch CVE fix commits, distill them into knowledge, and store it."""
+    cfg = _resolve_config(config, dry_run=False)
+    ids = list(cve or [])
+    if cve_file:
+        ids += [l.strip() for l in Path(cve_file).read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not ids:
+        console.print("[red]Provide at least one --cve or a --cve-file.[/]")
+        raise typer.Exit(2)
+
+    def prog(event: str, kw: dict) -> None:
+        if event == "cve_fetch":
+            console.print(f"[dim]Fetching {kw['cve']} ({kw['index']+1}/{kw['total']})…[/]")
+        elif event == "cve_done":
+            console.print(f"  {kw['cve']}: {kw['items']} item(s) from {kw['pairs']} pair(s)")
+        elif event == "cve_error":
+            console.print(f"  [red]{kw['cve']}: {kw['message']}[/]")
+
+    builder = _kb_builder(cfg, on_progress=prog)
+    summary = builder.build_from_cves(ids, skip_existing=skip_existing)
+    skipped = summary.get("skipped", 0)
+    console.print(
+        f"[green]Added {summary['added']} knowledge item(s).[/]"
+        + (f" Skipped {skipped} already in KB." if skipped else "")
+        + f" Store: {summary['stats']}"
+    )
+    for err in summary["errors"]:
+        console.print(f"[yellow]! {err}[/]")
+
+
+@kb_app.command("prepare-cvefixes")
+def kb_prepare_cvefixes(
+    source: str = typer.Argument(..., help="Path to CVEfixes_*.sql.gz (or a .sql dump)."),
+    output: str = typer.Argument(..., help="Output SQLite .db path to create."),
+    force: bool = typer.Option(False, "--force", help="Overwrite the output db if it exists."),
+) -> None:
+    """Convert a CVEfixes SQL dump to a SQLite db (no sqlite3 CLI needed).
+
+    Streams the (very large) dump so it never loads into memory. This can take a
+    while — the native `sqlite3` CLI is faster if you have it. Afterwards:
+    `icewall kb import --source cvefixes --db <output>`.
+    """
+    from icewall.knowledge.cvefixes import prepare_db
+
+    if not Path(source).exists():
+        console.print(f"[red]No such file: {source}[/]")
+        raise typer.Exit(2)
+    if Path(output).exists() and not force:
+        console.print(f"[red]{output} exists — pass --force to overwrite.[/]")
+        raise typer.Exit(2)
+    if Path(output).exists():
+        Path(output).unlink()
+
+    console.print(f"[dim]Loading {source} → {output} (streaming; this may take a while)…[/]")
+
+    def prog(event: str, kw: dict) -> None:
+        console.print(f"[dim]  {kw['statements']:,} statements, {kw['skipped']} skipped, {kw['seconds']}s[/]")
+
+    summary = prepare_db(source, output, on_progress=prog)
+    # Sanity-check a known table if present.
+    try:
+        import sqlite3
+
+        c = sqlite3.connect(output)
+        n = c.execute("SELECT COUNT(*) FROM method_change").fetchone()[0]
+        c.close()
+        extra = f", {n:,} method_change rows"
+    except Exception:
+        extra = ""
+    console.print(
+        f"[green]Done[/] — {summary['statements']:,} statements in {summary['seconds']}s "
+        f"({summary['skipped']} skipped){extra}. Now: "
+        f"[bold]icewall kb import --source cvefixes --db {output}[/]"
+    )
+
+
+@kb_app.command("import")
+def kb_import(
+    source: str = typer.Option(..., "--source", help="Dataset: cvefixes | osv"),
+    db: Optional[str] = typer.Option(None, "--db", help="CVEfixes .db path or dataset dir (cvefixes)."),
+    ecosystem: Optional[list[str]] = typer.Option(None, "--ecosystem", help="OSV ecosystem, repeatable: PyPI, npm."),
+    language: Optional[list[str]] = typer.Option(None, "--language", help="Language filter, repeatable. Default: python javascript typescript."),
+    cwe_filter: bool = typer.Option(True, "--cwe-filter/--no-cwe-filter", help="Restrict to Icewall's injection CWEs."),
+    limit: int = typer.Option(500, "--limit", help="Max knowledge items to ingest."),
+    skip_existing: bool = typer.Option(True, "--skip-existing/--no-skip-existing", help="Skip pairs already in the KB (dedup) before distilling."),
+    github_verify_ssl: bool = typer.Option(True, "--github-verify-ssl/--no-github-verify-ssl", help="Verify TLS when fetching patches from GitHub (osv)."),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Bulk-import knowledge from a downloaded CVE dataset (CVEfixes or OSV)."""
+    from icewall.knowledge.cvefixes import INJECTION_CWES
+
+    cfg = _resolve_config(config, dry_run=False)
+    langs = list(language) if language else ["python", "javascript", "typescript"]
+    cwe_ids = INJECTION_CWES if cwe_filter else None
+
+    def prog(event: str, kw: dict) -> None:
+        if event == "prepare_start":
+            console.print(f"[dim]Converting {kw['src']} → {kw['dest']} (streaming)…[/]")
+        elif event == "prepare_progress":
+            console.print(f"[dim]  building db {int(kw['pct']*100)}% ({kw['backend']}) — {kw['seconds']}s[/]")
+        elif event == "prepare_done":
+            console.print("[green]Database ready.[/]")
+        elif event == "index_build":
+            console.print(f"[dim]Indexing {kw['table']} ({kw['i']+1}/{kw['total']}) — one-time…[/]")
+        elif event == "index_done":
+            console.print(f"[dim]  indexed {kw['table']} in {kw['seconds']}s[/]")
+        elif event == "index_error":
+            console.print(f"[yellow]  index skipped: {kw.get('message','')[:80]}[/]")
+        elif event == "cvefixes_scan":
+            console.print(f"[dim]  scanned {kw['rows']:,} rows, {kw['pairs']} pairs…[/]")
+        elif event == "import_progress":
+            sk = f", {kw['skipped']} dup-skipped" if kw.get("skipped") else ""
+            console.print(f"[dim]  {kw['seen']} pairs seen, {kw['items']} items{sk}…[/]")
+
+    if source == "cvefixes":
+        from icewall.knowledge.cvefixes import CvefixesSource, resolve_or_prepare
+
+        dbp = db or cfg.knowledge.cvefixes_db
+        if not dbp:
+            console.print("[red]--db (a .db, or the CVEfixes dataset folder) is required for cvefixes.[/]")
+            raise typer.Exit(2)
+        try:
+            dbp = resolve_or_prepare(dbp, on_progress=prog)  # folder -> prepare .db if needed
+            # Uncapped source; the builder bounds the NEW-item count so duplicates
+            # don't consume the limit.
+            src = CvefixesSource(dbp, languages=langs, cwe_ids=cwe_ids, on_progress=prog)
+        except FileNotFoundError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(2)
+    elif source == "osv":
+        import os as _os
+
+        from icewall.knowledge.fetch import CveFetcher
+        from icewall.knowledge.osv_bulk import OsvBulkSource
+
+        ecos = list(ecosystem) if ecosystem else ["PyPI", "npm"]
+        token = _os.environ.get(cfg.knowledge.github_token_env) if cfg.knowledge.github_token_env else None
+        fetcher = CveFetcher(verify_ssl=github_verify_ssl, github_token=token)
+        src = OsvBulkSource(
+            ecos, cwe_ids=cwe_ids, fetcher=fetcher,  # uncapped; builder bounds new items
+            cache_dir=str(Path(cfg.knowledge.root) / "_osv_cache"),
+        )
+    else:
+        console.print("[red]--source must be 'cvefixes' or 'osv'.[/]")
+        raise typer.Exit(2)
+
+    console.print(f"[dim]Importing from {source} (limit {limit}, cwe_filter={cwe_filter}, skip_existing={skip_existing})…[/]")
+    summary = _kb_builder(cfg, on_progress=prog).build_from_pairs(
+        src.iter_pairs(), skip_existing=skip_existing, limit=limit)
+    skipped = summary.get("skipped", 0)
+    console.print(
+        f"[green]Added {summary['added']} item(s)[/] from {summary['seen']} pair(s)"
+        + (f", skipped {skipped} already in KB" if skipped else "")
+        + f". Store: {summary['stats']}"
+    )
+    for err in summary["errors"][:20]:
+        console.print(f"[yellow]! {err}[/]")
+
+
+@kb_app.command("seed")
+def kb_seed(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
+    """Seed the knowledge base from Icewall's bundled per-CWE skills (no network)."""
+    cfg = _resolve_config(config, dry_run=False) if (config or Path("icewall.yaml").exists()) else IcewallConfig.default()
+    summary = _kb_builder(cfg).seed_from_skills()
+    console.print(f"[green]Seeded {summary['added']} item(s).[/] Store: {summary['stats']}")
+
+
+@kb_app.command("stats")
+def kb_stats(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
+    """Show what's in the knowledge base."""
+    from icewall.knowledge import KnowledgeStore
+
+    cfg = _resolve_config(config, dry_run=False) if (config or Path("icewall.yaml").exists()) else IcewallConfig.default()
+    console.print(KnowledgeStore(cfg.knowledge).stats())
+
+
+@kb_app.command("clear")
+def kb_clear(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Delete all knowledge items."""
+    from icewall.knowledge import KnowledgeStore
+
+    cfg = _resolve_config(config, dry_run=False) if (config or Path("icewall.yaml").exists()) else IcewallConfig.default()
+    store = KnowledgeStore(cfg.knowledge)
+    n = len(store.items)
+    if not yes and n:
+        typer.confirm(f"Delete {n} knowledge item(s) from {cfg.knowledge.root}?", abort=True)
+    store.clear()
+    console.print(f"[green]Cleared {n} item(s).[/]")
+
+
 _SAMPLE_CONFIG = """\
 # Icewall configuration — one provider per agent, so each agent can have its own
 # API key and model tier. Fill in the api_key lines (or swap each for
@@ -480,6 +710,31 @@ memory:
 trace:
   enabled: true
   max_chars: 16000     # cap per captured field
+
+# Knowledge-level RAG (Vul-RAG): a store of vulnerability knowledge distilled
+# from real CVE+patch pairs, retrieved per finding and fed to the validator to
+# sharpen the vulnerable-vs-patched decision. Build it with `icewall kb build
+# --cve CVE-2023-... ` (fetches fix commits) or `icewall kb seed` (from skills).
+knowledge:
+  enabled: false          # turn on to augment the validator with retrieved knowledge
+  root: kb                # where items.jsonl lives (persistent, shippable)
+  top_k: 6                # knowledge items injected per finding
+  min_score: 0.0
+  distiller_provider: analyzer_provider   # cheap-ish provider for the offline build
+  distiller_model: claude-haiku-4-5
+  fetch_verify_ssl: true
+  # github_token_env: GITHUB_TOKEN        # raises commit-fetch rate limits
+  # Bulk import: `icewall kb import --source cvefixes --db <path>` (no GitHub) or
+  # `--source osv --ecosystem PyPI --ecosystem npm` (fetches patches from GitHub).
+  # cvefixes_db: Data/CVEfixes.db         # default CVEfixes SQLite path
+  # Embeddings endpoint (OpenAI-compatible) used for retrieval. Leave model empty
+  # to disable embeddings and use the local BM25 fallback.
+  embedding:
+    base_url: https://api.openai.com/v1
+    model: ""             # e.g. text-embedding-3-small; empty => BM25 fallback
+    api_key_env: OPENAI_API_KEY
+    verify_ssl: true
+    # dimensions: 1536
 
 budget:
   max_total_tokens: 2000000

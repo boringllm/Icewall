@@ -22,7 +22,7 @@ SAMPLE = os.path.abspath(
 
 @pytest.fixture()
 def client(tmp_path):
-    app = create_app(workshop_root=str(tmp_path / "ws"))
+    app = create_app(workshop_root=str(tmp_path / "ws"), kb_root=str(tmp_path / "kb"))
     return TestClient(app)
 
 
@@ -73,6 +73,21 @@ def test_presets_crud(client):
     # delete
     assert client.delete(f"/api/presets/{name}").json()["deleted"] is True
     assert client.get(f"/api/presets/{name}").status_code == 404
+
+
+def test_preset_carries_provider_timeout_and_retries(client):
+    # The config form now exposes provider timeout/max_retries/extra_headers;
+    # a preset must round-trip them so they aren't silently dropped.
+    cfg = client.get("/api/config/template").json()
+    cfg["providers"]["ui"] = {
+        "type": "openai", "base_url": "https://x/v1",
+        "timeout": 45, "max_retries": 2, "extra_headers": {"X-Gw": "k"},
+    }
+    for a in cfg["agents"].values():
+        a["provider"] = "ui"
+    client.put("/api/presets/prov", json={"config": cfg})
+    p = client.get("/api/presets/prov").json()["config"]["providers"]["ui"]
+    assert p["timeout"] == 45 and p["max_retries"] == 2 and p["extra_headers"] == {"X-Gw": "k"}
 
 
 def test_import_config_file_as_preset(client, tmp_path):
@@ -170,6 +185,211 @@ def test_scan_honors_intensity(client):
 def test_scan_bad_target_400(client):
     r = client.post("/api/scan", json={"target": "does/not/exist", "dry_run": True})
     assert r.status_code == 400
+
+
+# --- knowledge base (Vul-RAG) ------------------------------------------------
+
+def test_kb_seed_stats_items_and_clear(client):
+    empty = client.get("/api/kb/stats").json()
+    assert empty["count"] == 0 and empty["has_embedding"] is False
+
+    seeded = client.post("/api/kb/seed", json={}).json()
+    assert seeded["added"] >= 5
+
+    stats = client.get("/api/kb/stats").json()
+    assert stats["count"] == seeded["added"]
+    assert "command_injection" in stats["by_class"]
+
+    items = client.get("/api/kb/items", params={"vuln_class": "command_injection"}).json()
+    assert items and all(i["vuln_class"] == "command_injection" for i in items)
+    assert "embedding" not in items[0]  # trimmed from the payload
+
+    assert client.delete("/api/kb").json()["cleared"] == seeded["added"]
+    assert client.get("/api/kb/stats").json()["count"] == 0
+
+
+def test_kb_build_requires_cves(client):
+    r = client.post("/api/kb/build", json={"cves": [], "distiller": {"type": "mock"}, "distiller_model": "m"})
+    assert r.status_code == 400
+
+
+def test_kb_import_validation(client):
+    base = {"distiller": {"type": "mock"}, "distiller_model": "m"}
+    assert client.post("/api/kb/import", json={"source": "nope", **base}).status_code == 400
+    assert client.post("/api/kb/import", json={"source": "cvefixes", **base}).status_code == 400  # no db
+
+
+def test_kb_import_cvefixes_builds_items(client, tmp_path):
+    import sqlite3
+
+    db = tmp_path / "CVEfixes.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        "CREATE TABLE cve(cve_id TEXT, description TEXT);"
+        "CREATE TABLE fixes(cve_id TEXT, hash TEXT, repo_url TEXT);"
+        "CREATE TABLE file_change(file_change_id TEXT, hash TEXT, programming_language TEXT);"
+        "CREATE TABLE method_change(file_change_id TEXT, name TEXT, before_change INT, code TEXT);"
+        "CREATE TABLE cwe_classification(cve_id TEXT, cwe_id TEXT);"
+        "INSERT INTO cve VALUES('CVE-1','sqli');"
+        "INSERT INTO fixes VALUES('CVE-1','h1','u');"
+        "INSERT INTO file_change VALUES('f1','h1','Python');"
+        "INSERT INTO method_change VALUES('f1','search',1,'execute(\"SELECT \"+v)');"
+        "INSERT INTO method_change VALUES('f1','search',0,'execute(\"SELECT ?\", v)');"
+        "INSERT INTO cwe_classification VALUES('CVE-1','CWE-89');"
+    )
+    conn.commit()
+    conn.close()
+
+    job = client.post("/api/kb/import", json={
+        "source": "cvefixes", "db_path": str(db),
+        "distiller": {"type": "mock"}, "distiller_model": "mock-1", "limit": 5,
+    }).json()
+    # Drain the shared build-event stream to completion.
+    with client.stream("GET", f"/api/kb/build/{job['id']}/events") as resp:
+        for line in resp.iter_lines():
+            if line and line.startswith("data: ") and json.loads(line[6:])["event"] == "stream_end":
+                break
+    stats = client.get("/api/kb/stats").json()
+    assert stats["count"] == 1 and "sql_injection" in stats["by_class"]
+
+
+def _drain(client, job_id):
+    summary = None
+    with client.stream("GET", f"/api/kb/build/{job_id}/events") as resp:
+        for line in resp.iter_lines():
+            if not (line and line.startswith("data: ")):
+                continue
+            ev = json.loads(line[6:])
+            if ev["event"] == "build_complete":
+                summary = ev
+            if ev["event"] == "stream_end":
+                break
+    return summary
+
+
+def _make_cvefixes_db(path):
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE cve(cve_id TEXT, description TEXT);"
+        "CREATE TABLE fixes(cve_id TEXT, hash TEXT, repo_url TEXT);"
+        "CREATE TABLE file_change(file_change_id TEXT, hash TEXT, programming_language TEXT);"
+        "CREATE TABLE method_change(file_change_id TEXT, name TEXT, before_change INT, code TEXT);"
+        "CREATE TABLE cwe_classification(cve_id TEXT, cwe_id TEXT);"
+        "INSERT INTO cve VALUES('CVE-1','sqli');"
+        "INSERT INTO fixes VALUES('CVE-1','h1','u');"
+        "INSERT INTO file_change VALUES('f1','h1','Python');"
+        "INSERT INTO method_change VALUES('f1','search',1,'execute(\"SELECT \"+v)');"
+        "INSERT INTO method_change VALUES('f1','search',0,'execute(\"SELECT ?\", v)');"
+        "INSERT INTO cwe_classification VALUES('CVE-1','CWE-89');"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_kb_test_llm_probes_distiller(client):
+    # Mock provider answers a tiny completion => ok with a latency reading.
+    r = client.post("/api/kb/test-llm", json={
+        "distiller": {"type": "mock"}, "distiller_model": "mock-1"}).json()
+    assert r["ok"] is True and "latency_ms" in r
+    # Missing model is a client error.
+    assert client.post("/api/kb/test-llm", json={
+        "distiller": {"type": "mock"}, "distiller_model": ""}).status_code == 400
+
+
+def test_kb_test_embedding_reports_bm25_without_model(client):
+    r = client.post("/api/kb/test-embedding", json={"embedding": None}).json()
+    assert r["ok"] is True and r["mode"] == "bm25"
+    r2 = client.post("/api/kb/test-embedding", json={"embedding": {"model": ""}}).json()
+    assert r2["mode"] == "bm25"
+
+
+def test_kb_import_skip_existing_dedups_on_reimport(client, tmp_path):
+    db = tmp_path / "CVEfixes.db"
+    _make_cvefixes_db(str(db))
+    body = {
+        "source": "cvefixes", "db_path": str(db),
+        "distiller": {"type": "mock"}, "distiller_model": "mock-1", "limit": 5,
+    }
+    first = _drain(client, client.post("/api/kb/import", json=body).json()["id"])
+    assert first["added"] == 1 and first.get("skipped", 0) == 0
+
+    # Re-import the same dataset: the one pair is already in the KB -> skipped.
+    second = _drain(client, client.post("/api/kb/import", json=body).json()["id"])
+    assert second["added"] == 0 and second["skipped"] == 1
+    assert client.get("/api/kb/stats").json()["count"] == 1
+
+
+def test_kb_search_and_delete_item(client):
+    client.post("/api/kb/seed", json={})  # BM25 base, several classes
+    all_items = client.get("/api/kb/items").json()
+    assert all_items
+
+    # BM25 search returns ranked matches with scores.
+    res = client.post("/api/kb/search", json={
+        "query": "sql database query from user input", "mode": "bm25"}).json()
+    assert res["mode"] == "bm25" and res["results"]
+    assert "score" in res["results"][0] and "id" in res["results"][0]
+
+    # Delete one item by id.
+    victim = all_items[0]["id"]
+    assert client.delete(f"/api/kb/items/{victim}").json()["deleted"] == 1
+    remaining = {i["id"] for i in client.get("/api/kb/items").json()}
+    assert victim not in remaining
+
+    # Bulk delete by id list.
+    ids = list(remaining)[:2]
+    assert client.post("/api/kb/items/delete", json={"ids": ids}).json()["deleted"] == len(ids)
+    assert client.post("/api/kb/items/delete", json={"ids": []}).status_code == 400
+
+
+def test_kb_search_embedding_mode_errors_without_model(client):
+    client.post("/api/kb/seed", json={})  # seeded without embeddings
+    r = client.post("/api/kb/search", json={"query": "x", "mode": "embedding"})
+    assert r.status_code == 400  # no embedding model / no embedded items
+    assert client.post("/api/kb/search", json={"query": "x", "mode": "nope"}).status_code == 400
+
+
+def test_kb_endpoint_presets_crud(client):
+    assert client.get("/api/kb/endpoint-presets").json() == []
+    body = {
+        "distiller": {"type": "openai", "base_url": "https://x/v1", "timeout": 60, "max_retries": 1},
+        "distiller_model": "cheap-1",
+        "embedding": {"model": "emb-1", "base_url": "https://y/v1"},
+    }
+    name = client.put("/api/kb/endpoint-presets/My Endpoints", json=body).json()["name"]
+    assert name == "My-Endpoints"  # sanitized
+    assert any(p["name"] == name for p in client.get("/api/kb/endpoint-presets").json())
+
+    got = client.get(f"/api/kb/endpoint-presets/{name}").json()
+    assert got["distiller"]["timeout"] == 60 and got["distiller_model"] == "cheap-1"
+    assert got["embedding"]["model"] == "emb-1"
+
+    # An invalid provider config is rejected before it is stored.
+    assert client.put("/api/kb/endpoint-presets/bad", json={"distiller": {"type": "nope"}}).status_code == 400
+
+    assert client.delete(f"/api/kb/endpoint-presets/{name}").json()["deleted"] is True
+    assert client.get(f"/api/kb/endpoint-presets/{name}").status_code == 404
+
+
+def test_scan_with_knowledge_toggle_attaches_refs(client):
+    client.post("/api/kb/seed", json={})  # BM25 knowledge base
+    _, events = _run_scan_to_completion(client, {"target": SAMPLE, "dry_run": True, "knowledge": True})
+    assert any(e["event"] == "scan_complete" for e in events)
+
+    sid = client.get("/api/sessions").json()[0]["id"]
+    findings = client.get(f"/api/sessions/{sid}").json()["findings"]
+    refs = [f.get("knowledge_refs") for f in findings if f.get("knowledge_refs")]
+    assert refs, "expected at least one finding to cite retrieved knowledge"
+
+
+def test_scan_without_toggle_has_no_refs(client):
+    client.post("/api/kb/seed", json={})
+    _run_scan_to_completion(client, {"target": SAMPLE, "dry_run": True})  # no knowledge flag
+    sid = client.get("/api/sessions").json()[0]["id"]
+    findings = client.get(f"/api/sessions/{sid}").json()["findings"]
+    assert all(not f.get("knowledge_refs") for f in findings)
 
 
 def test_scan_reconnect_replays_events(client):

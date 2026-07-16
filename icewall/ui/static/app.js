@@ -44,6 +44,8 @@ function showView(name) {
   $$("nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   if (name === "sessions") loadSessions();
   if (name === "presets") loadPresets();
+  if (name === "knowledge") loadKnowledge();
+  if (name === "build") { refreshKbStats(); loadKbEndpointPresets(); }  // hint + saved presets
 }
 $$("nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
 
@@ -76,7 +78,7 @@ const PARAM_SPECS = {
 
 function defaultFormModel() {
   return {
-    provider: { type: "mock", base_url: "", api_key: "", api_key_env: "", verify_ssl: true },
+    provider: { type: "mock", base_url: "", api_key: "", api_key_env: "", verify_ssl: true, timeout: "", max_retries: "", extra_headers: "" },
     agents: {
       triage: agentDefaults("claude-haiku-4-5", 2048),
       tracer: agentDefaults("claude-haiku-4-5", 3072),
@@ -102,6 +104,12 @@ function modelToConfig(m) {
   if (m.provider.api_key) prov.api_key = m.provider.api_key;
   if (m.provider.api_key_env) prov.api_key_env = m.provider.api_key_env;
   prov.verify_ssl = m.provider.verify_ssl !== false;
+  if (m.provider.timeout !== "" && m.provider.timeout != null) prov.timeout = Number(m.provider.timeout);
+  if (m.provider.max_retries !== "" && m.provider.max_retries != null) prov.max_retries = Number(m.provider.max_retries);
+  if (m.provider.extra_headers && m.provider.extra_headers.trim()) {
+    try { prov.extra_headers = JSON.parse(m.provider.extra_headers); }
+    catch (e) { throw new Error(`Invalid JSON in provider extra headers: ${e.message}`); }
+  }
   const agents = {};
   for (const r of ROLES) {
     const a = m.agents[r];
@@ -154,7 +162,12 @@ function configToModel(cfg) {
   // Use the provider referenced by the triage agent (or the first one).
   const triageProv = cfg.agents?.triage?.provider || provNames[0];
   const p = (cfg.providers || {})[triageProv] || {};
-  m.provider = { type: p.type || "mock", base_url: p.base_url || "", api_key: p.api_key || "", api_key_env: p.api_key_env || "", verify_ssl: p.verify_ssl !== false };
+  m.provider = {
+    type: p.type || "mock", base_url: p.base_url || "", api_key: p.api_key || "",
+    api_key_env: p.api_key_env || "", verify_ssl: p.verify_ssl !== false,
+    timeout: p.timeout ?? "", max_retries: p.max_retries ?? "",
+    extra_headers: (p.extra_headers && Object.keys(p.extra_headers).length) ? JSON.stringify(p.extra_headers, null, 2) : "",
+  };
   const specKeys = new Set((PARAM_SPECS[m.provider.type] || []).map((s) => s.key));
   for (const r of ROLES) {
     const a = (cfg.agents || {})[r];
@@ -233,6 +246,13 @@ function renderSettings(container, m) {
     txt("API key (inline, optional)", m.provider, "api_key", "sk-…"),
     txt("or API key env var", m.provider, "api_key_env", "ANTHROPIC_API_KEY")));
   container.append(chk("Verify SSL certificate (uncheck to skip cert check — insecure)", m.provider, "verify_ssl"));
+  container.append(el("div", { class: "row" },
+    num("Request timeout (s) — blank = SDK default", m.provider, "timeout"),
+    num("Max retries — blank = SDK default", m.provider, "max_retries")));
+  container.append(el("div", { class: "field" },
+    el("label", {}, "Extra headers (raw JSON — for gateways/proxies)"),
+    el("textarea", { rows: 2, placeholder: '{"X-Gateway-Key": "…"}', oninput: (e) => (m.provider.extra_headers = e.target.value) },
+      m.provider.extra_headers || "")));
 
   container.append(el("div", { class: "subhead" }, "Agents — model & generation parameters"));
   container.append(el("div", { class: "muted", style: "font-size:11.5px; margin:-4px 0 8px" },
@@ -403,6 +423,7 @@ async function startScan() {
     catch (e) { return toast(e.message, true); }
   }
   body.intensity = scanIntensity;  // applies to dry-run / preset / form alike
+  body.knowledge = $("#use-knowledge").checked;  // Vul-RAG validator augmentation
   let job;
   try {
     job = await api("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -794,6 +815,415 @@ $("#pe-delete").addEventListener("click", async () => {
   toast("Deleted '" + name + "'"); loadPresets(); refreshPresetDropdown();
 });
 
+// ------------------------------------------------------------------ knowledge base (Vul-RAG)
+let kbBuildES = null;
+let kbLimit = null;  // requested item cap, drives the import progress bar
+const fmtMB = (b) => (b == null ? "?" : (b / 1048576).toFixed(0) + " MB");
+
+function startKbProg() {
+  $("#kb-prog-wrap").style.display = "block";
+  setKbProg(0, "Starting…");
+}
+function setKbProg(frac, label) {
+  const p = Math.max(0, Math.min(100, Math.round(frac * 100)));
+  $("#kb-prog").style.width = p + "%";
+  $("#kb-prog-pct").textContent = p + "%";
+  if (label) $("#kb-prog-label").textContent = label;
+}
+
+async function loadKnowledge() {
+  await refreshKbStats();
+  await loadKbItems();
+}
+
+async function refreshKbStats() {
+  const s = await api("/api/kb/stats").catch(() => null);
+  if (!s) return;
+  setTile("kb-count", fmt(s.count));
+  setTile("kb-embedded", fmt(s.embedded));
+  $("#kb-mode").textContent = s.has_embedding ? "embeddings" : "BM25";
+  // Per-class chips.
+  const box = $("#kb-classes"); box.innerHTML = "";
+  const entries = Object.entries(s.by_class || {});
+  for (const [cls, n] of entries)
+    box.append(el("span", {}, el("i", { style: "background:#4aa8ff" }), `${cls}: ${n}`));
+  if (!entries.length) box.append(el("span", { class: "muted" }, "empty — build or seed to populate"));
+  // Class filter dropdown.
+  const sel = $("#kb-filter"), cur = sel.value;
+  sel.innerHTML = '<option value="">— all —</option>';
+  for (const [cls] of entries) sel.append(el("option", { value: cls }, cls));
+  sel.value = cur;
+  // Hint on the scan toggle so users know whether the KB has anything.
+  const hint = $("#kb-toggle-hint");
+  if (hint) hint.textContent = s.count ? `(${s.count} items, ${s.has_embedding ? "embeddings" : "BM25"})` : "(empty — build one in the Build KB tab)";
+  // Header hint on the Build view.
+  const bh = $("#kb-build-hint");
+  if (bh) bh.textContent = s.count ? `${fmt(s.count)} items in the base · ${s.has_embedding ? "embeddings" : "BM25"}` : "the base is empty";
+}
+
+function kbItemCard(it, opts = {}) {
+  // A knowledge-item card. In `select` mode it gets a checkbox (for the
+  // find-&-delete list); otherwise a per-item ✕ delete button.
+  const head = el("div", { class: "kb-item-head" },
+    el("span", { class: "sev medium" }, it.vuln_class || "—"),
+    el("span", { class: "mono muted", style: "font-size:11px" }, it.source || ""),
+    el("span", { class: "spacer" }));
+  if (opts.score != null) head.append(el("span", { class: "mono muted", style: "font-size:11px", title: "relevance score" }, "score " + opts.score));
+  if (opts.select) {
+    const cb = el("input", { type: "checkbox", class: "kb-cb", value: it.id, title: "Select" });
+    if (opts.onToggle) cb.addEventListener("change", opts.onToggle);
+    head.append(cb);
+  } else {
+    const del = el("button", { class: "danger ghost", style: "flex:0 0 auto; padding:2px 8px; font-size:12px", title: "Delete this item" }, "✕");
+    del.addEventListener("click", () => deleteKbItem(it.id, it.vuln_class));
+    head.append(del);
+  }
+  return el("div", { class: "kb-item" },
+    head,
+    it.abstract_cause ? el("div", { class: "kb-line" }, el("b", {}, "cause: "), it.abstract_cause) : "",
+    it.fixing_solution ? el("div", { class: "kb-line" }, el("b", {}, "fix: "), (it.fixing_solution || "").slice(0, 240)) : "");
+}
+
+async function loadKbItems() {
+  const cls = $("#kb-filter").value;
+  const items = await api("/api/kb/items" + (cls ? "?vuln_class=" + encodeURIComponent(cls) : "")).catch(() => []);
+  const box = $("#kb-items"); box.innerHTML = "";
+  if (!items.length) { box.append(el("div", { class: "muted", style: "padding:12px" }, "No items yet.")); return; }
+  for (const it of items) box.append(kbItemCard(it));
+}
+
+async function deleteKbItem(id, label) {
+  if (!confirm(`Delete this ${label || "knowledge"} item?`)) return;
+  try {
+    const r = await api(`/api/kb/items/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast(`Deleted ${r.deleted} item(s)`);
+    loadKnowledge();
+  } catch (e) { toast("Delete failed: " + e.message, true); }
+}
+
+function kbEmbeddingBody() {
+  const model = $("#kb-emb-model").value.trim();
+  if (!model) return null;  // BM25 fallback
+  const emb = { model, verify_ssl: $("#kb-emb-ssl").checked };
+  const bu = $("#kb-emb-baseurl").value.trim(); if (bu) emb.base_url = bu;
+  const k = $("#kb-emb-key").value.trim(); if (k) emb.api_key = k;
+  const ke = $("#kb-emb-keyenv").value.trim(); if (ke) emb.api_key_env = ke;
+  const d = $("#kb-emb-dims").value.trim(); if (d) emb.dimensions = Number(d);
+  const t = $("#kb-emb-timeout").value.trim(); if (t) emb.timeout = Number(t);
+  const r = $("#kb-emb-retries").value.trim(); if (r !== "") emb.max_retries = Number(r);
+  return emb;
+}
+
+function kbDistillerBody() {
+  const prov = { type: $("#kb-dist-type").value, verify_ssl: $("#kb-dist-ssl").checked };
+  const bu = $("#kb-dist-baseurl").value.trim(); if (bu) prov.base_url = bu;
+  const k = $("#kb-dist-key").value.trim(); if (k) prov.api_key = k;
+  const ke = $("#kb-dist-keyenv").value.trim(); if (ke) prov.api_key_env = ke;
+  const t = $("#kb-dist-timeout").value.trim(); if (t) prov.timeout = Number(t);
+  const r = $("#kb-dist-retries").value.trim(); if (r !== "") prov.max_retries = Number(r);
+  return prov;
+}
+
+// ---- endpoint presets (distiller + embedding) ----
+function setKbDistiller(prov, model) {
+  prov = prov || {};
+  $("#kb-dist-type").value = prov.type || "openai";
+  $("#kb-dist-baseurl").value = prov.base_url || "";
+  $("#kb-dist-model").value = model || "";
+  $("#kb-dist-key").value = prov.api_key || "";
+  $("#kb-dist-keyenv").value = prov.api_key_env || "";
+  $("#kb-dist-timeout").value = prov.timeout ?? "";
+  $("#kb-dist-retries").value = prov.max_retries ?? "";
+  $("#kb-dist-ssl").checked = prov.verify_ssl !== false;
+}
+function setKbEmbedding(emb) {
+  $("#kb-emb-baseurl").value = emb?.base_url || "";
+  $("#kb-emb-model").value = emb?.model || "";
+  $("#kb-emb-key").value = emb?.api_key || "";
+  $("#kb-emb-keyenv").value = emb?.api_key_env || "";
+  $("#kb-emb-dims").value = emb?.dimensions ?? "";
+  $("#kb-emb-timeout").value = emb?.timeout ?? "";
+  $("#kb-emb-retries").value = emb?.max_retries ?? "";
+  $("#kb-emb-ssl").checked = emb ? emb.verify_ssl !== false : true;
+}
+
+async function loadKbEndpointPresets(selected) {
+  const list = await api("/api/kb/endpoint-presets").catch(() => []);
+  const sel = $("#kb-ep-preset"); const cur = selected ?? sel.value;
+  sel.innerHTML = '<option value="">— saved endpoint presets —</option>';
+  for (const p of list) sel.append(el("option", { value: p.name }, p.name));
+  sel.value = cur || "";
+}
+
+$("#kb-ep-load").addEventListener("click", async () => {
+  const name = $("#kb-ep-preset").value;
+  if (!name) return toast("Pick a preset to load", true);
+  try {
+    const p = await api("/api/kb/endpoint-presets/" + encodeURIComponent(name));
+    setKbDistiller(p.distiller, p.distiller_model);
+    setKbEmbedding(p.embedding);
+    $("#kb-ep-name").value = p.name;
+    toast(`Loaded endpoint preset '${p.name}'`);
+  } catch (e) { toast("Load failed: " + e.message, true); }
+});
+
+$("#kb-ep-save").addEventListener("click", async () => {
+  const name = ($("#kb-ep-name").value || $("#kb-ep-preset").value).trim();
+  if (!name) return toast("Enter a preset name", true);
+  const body = {
+    distiller: kbDistillerBody(),
+    distiller_model: $("#kb-dist-model").value.trim(),
+    embedding: kbEmbeddingBody(),
+  };
+  try {
+    const r = await api("/api/kb/endpoint-presets/" + encodeURIComponent(name), {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    toast(`Saved endpoint preset '${r.name}'`);
+    await loadKbEndpointPresets(r.name);
+  } catch (e) { toast("Save failed: " + e.message, true); }
+});
+
+$("#kb-ep-del").addEventListener("click", async () => {
+  const name = $("#kb-ep-preset").value;
+  if (!name) return toast("Pick a preset to delete", true);
+  if (!confirm(`Delete endpoint preset '${name}'?`)) return;
+  try {
+    await api("/api/kb/endpoint-presets/" + encodeURIComponent(name), { method: "DELETE" });
+    toast(`Deleted '${name}'`);
+    $("#kb-ep-name").value = "";
+    await loadKbEndpointPresets("");
+  } catch (e) { toast("Delete failed: " + e.message, true); }
+});
+
+// ---- connection tests
+function kbTestStatus(el, state, text) {
+  el.textContent = text;
+  el.style.color = state === "ok" ? "var(--ok, #2ecc71)" : state === "err" ? "var(--err, #ff6b6b)" : "";
+}
+
+$("#kb-test-llm").addEventListener("click", async () => {
+  const status = $("#kb-test-llm-status");
+  const model = $("#kb-dist-model").value.trim();
+  if (!model) return kbTestStatus(status, "err", "Enter a distiller model first.");
+  kbTestStatus(status, "pending", "Testing distiller…");
+  try {
+    const r = await api("/api/kb/test-llm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ distiller: kbDistillerBody(), distiller_model: model }),
+    });
+    if (r.ok) kbTestStatus(status, "ok", `✓ ${r.model} responded in ${r.latency_ms} ms${r.sample ? ` — “${r.sample}”` : ""}`);
+    else kbTestStatus(status, "err", "✗ " + (r.error || "failed"));
+  } catch (e) { kbTestStatus(status, "err", "✗ " + e.message); }
+});
+
+$("#kb-test-emb").addEventListener("click", async () => {
+  const status = $("#kb-test-emb-status");
+  kbTestStatus(status, "pending", "Testing embedding endpoint…");
+  try {
+    const r = await api("/api/kb/test-embedding", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ embedding: kbEmbeddingBody() }),
+    });
+    if (r.ok && r.mode === "bm25") kbTestStatus(status, "ok", "ℹ " + r.note);
+    else if (r.ok) kbTestStatus(status, "ok", `✓ ${r.model}: ${r.dimensions}-dim vector in ${r.latency_ms} ms`);
+    else kbTestStatus(status, "err", "✗ " + (r.error || "failed"));
+  } catch (e) { kbTestStatus(status, "err", "✗ " + e.message); }
+});
+
+function kbLog(text, cls) {
+  const l = $("#kb-log");
+  if (l.firstChild && l.firstChild.classList && l.firstChild.classList.contains("muted")) l.innerHTML = "";
+  l.append(el("div", cls ? { class: cls } : {}, text));
+  l.scrollTop = l.scrollHeight;
+}
+
+// ---- Build-view sub-tabs (show one pane at a time) ----
+$$("#kb-tabs .seg").forEach((btn) => btn.addEventListener("click", () => {
+  const t = btn.dataset.kbtab;
+  $$("#kb-tabs .seg").forEach((b) => b.classList.toggle("active", b === btn));
+  $$(".kb-tabpane").forEach((p) => p.classList.toggle("hidden", p.id !== "kbtab-" + t));
+}));
+
+$("#kb-refresh").addEventListener("click", loadKnowledge);
+$("#kb-filter").addEventListener("change", loadKbItems);
+
+// ---- find & delete (search -> tick -> bulk delete) ----
+function kbSearchSelUI() {
+  const boxes = $$("#kb-search-results .kb-cb");
+  const checked = boxes.filter((c) => c.checked);
+  $("#kb-search-del").disabled = checked.length === 0;
+  $("#kb-search-del").textContent = checked.length ? `Delete selected (${checked.length})` : "Delete selected";
+  boxes.forEach((c) => c.closest(".kb-item").classList.toggle("sel", c.checked));
+  const master = $("#kb-search-all");
+  master.checked = boxes.length > 0 && checked.length === boxes.length;
+  master.indeterminate = checked.length > 0 && checked.length < boxes.length;
+}
+
+async function runKbSearch() {
+  const query = $("#kb-search-q").value.trim();
+  if (!query) return toast("Enter a search query", true);
+  const mode = $("#kb-search-mode").value;
+  const vuln_class = $("#kb-filter").value || null;  // respect the class filter
+  let res;
+  try {
+    res = await api("/api/kb/search", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, mode, vuln_class, limit: 50 }),
+    });
+  } catch (e) { return toast("Search failed: " + e.message, true); }
+  $("#kb-search-wrap").classList.remove("hidden");
+  $("#kb-search-all").checked = false;
+  const box = $("#kb-search-results"); box.innerHTML = "";
+  $("#kb-search-meta").textContent =
+    `${res.results.length} match(es) · ${res.mode.toUpperCase()}${vuln_class ? " · " + vuln_class : ""}`;
+  if (!res.results.length) { box.append(el("div", { class: "muted", style: "padding:10px" }, "No matches.")); }
+  for (const it of res.results) box.append(kbItemCard(it, { select: true, score: it.score, onToggle: kbSearchSelUI }));
+  kbSearchSelUI();
+}
+
+$("#kb-search-btn").addEventListener("click", runKbSearch);
+$("#kb-search-q").addEventListener("keydown", (e) => { if (e.key === "Enter") runKbSearch(); });
+$("#kb-search-all").addEventListener("change", (e) => {
+  $$("#kb-search-results .kb-cb").forEach((c) => (c.checked = e.target.checked));
+  kbSearchSelUI();
+});
+$("#kb-search-del").addEventListener("click", async () => {
+  const ids = $$("#kb-search-results .kb-cb").filter((c) => c.checked).map((c) => c.value);
+  if (!ids.length) return toast("Select at least one match to delete", true);
+  if (!confirm(`Delete ${ids.length} selected item(s)? This cannot be undone.`)) return;
+  try {
+    const r = await api("/api/kb/items/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    toast(`Deleted ${r.deleted} item(s)`);
+    await runKbSearch();  // refresh the match list
+    loadKnowledge();      // refresh stats + browse list
+  } catch (e) { toast("Delete failed: " + e.message, true); }
+});
+
+$("#kb-seed").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/kb/seed", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ embedding: kbEmbeddingBody() }),
+    });
+    toast(`Seeded ${r.added} item(s) from skills`);
+    kbLog(`Seeded ${r.added} item(s) from bundled skills.`);
+    loadKnowledge();
+  } catch (e) { toast("Seed failed: " + e.message, true); }
+});
+
+$("#kb-clear").addEventListener("click", async () => {
+  if (!confirm("Delete all knowledge items?")) return;
+  try {
+    const r = await api("/api/kb", { method: "DELETE" });
+    toast(`Cleared ${r.cleared} item(s)`);
+    kbLog(`Cleared ${r.cleared} item(s).`);
+    loadKnowledge();
+  } catch (e) { toast("Clear failed: " + e.message, true); }
+});
+
+$("#kb-build").addEventListener("click", async () => {
+  const cves = $("#kb-cves").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (!cves.length) return toast("Enter at least one CVE id", true);
+  const model = $("#kb-dist-model").value.trim();
+  if (!model) return toast("Enter a distiller model", true);
+  const body = {
+    cves, distiller: kbDistillerBody(), distiller_model: model,
+    embedding: kbEmbeddingBody(), top_k: Number($("#kb-topk").value) || 6,
+    fetch_verify_ssl: $("#kb-fetch-ssl").checked,
+    skip_existing: $("#kb-skip-existing").checked,
+  };
+  let job;
+  try {
+    job = await api("/api/kb/build", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch (e) { return toast("Build failed to start: " + e.message, true); }
+  $("#kb-log").innerHTML = "";
+  kbLimit = null; startKbProg();
+  kbLog(`Build started for ${cves.length} CVE(s)…`, "kb-build-head");
+  if (kbBuildES) kbBuildES.close();
+  kbBuildES = new EventSource(`/api/kb/build/${job.id}/events`);
+  kbBuildES.onmessage = (e) => handleKbBuildEvent(JSON.parse(e.data));
+  kbBuildES.onerror = () => { /* ends server-side */ };
+});
+
+// ---- dataset import
+$("#kb-imp-source").addEventListener("change", (e) => {
+  const osv = e.target.value === "osv";
+  $("#kb-imp-osv").classList.toggle("hidden", !osv);
+  $("#kb-imp-cvefixes").classList.toggle("hidden", osv);
+});
+
+$("#kb-import").addEventListener("click", async () => {
+  const source = $("#kb-imp-source").value;
+  const model = $("#kb-dist-model").value.trim();
+  if (!model) return toast("Enter a distiller model (above)", true);
+  const languages = $$(".kb-lang").filter((c) => c.checked).map((c) => c.value);
+  const body = {
+    source,
+    languages,
+    cwe_filter: $("#kb-imp-cwe").checked,
+    limit: Number($("#kb-imp-limit").value) || 500,
+    distiller: kbDistillerBody(),
+    distiller_model: model,
+    embedding: kbEmbeddingBody(),
+    skip_existing: $("#kb-imp-skip").checked,
+  };
+  if (source === "cvefixes") {
+    body.db_path = $("#kb-imp-db").value.trim();
+    if (!body.db_path) return toast("Enter the CVEfixes .db path", true);
+  } else {
+    body.ecosystems = $$(".kb-eco").filter((c) => c.checked).map((c) => c.value);
+    if (!body.ecosystems.length) return toast("Pick at least one ecosystem", true);
+    body.fetch_verify_ssl = $("#kb-osv-ssl").checked;
+  }
+  let job;
+  try {
+    job = await api("/api/kb/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch (e) { return toast("Import failed to start: " + e.message, true); }
+  $("#kb-log").innerHTML = "";
+  kbLimit = body.limit; startKbProg();
+  kbLog(`Import from ${source} started…`, "kb-build-head");
+  if (kbBuildES) kbBuildES.close();
+  kbBuildES = new EventSource(`/api/kb/build/${job.id}/events`);
+  kbBuildES.onmessage = (e) => handleKbBuildEvent(JSON.parse(e.data));
+  kbBuildES.onerror = () => { /* ends server-side */ };
+});
+
+function handleKbBuildEvent(ev) {
+  const t = ev.event;
+  if (t === "prepare_start") { setKbProg(0, "Converting dataset → SQLite…"); kbLog(`Converting ${ev.src} → SQLite…`, "kb-build-head"); }
+  else if (t === "prepare_progress") setKbProg(ev.pct, `Building database (${ev.backend}) — ${fmtMB(ev.bytes)} / ${fmtMB(ev.total)} · ${ev.seconds}s`);
+  else if (t === "prepare_done") { setKbProg(1, "Database ready — starting import…"); kbLog("Database ready.", "muted"); }
+  else if (t === "index_build") { setKbProg((ev.i) / (ev.total || 1), `Indexing ${ev.table} (${ev.i + 1}/${ev.total}) — one-time…`); kbLog(`Indexing ${ev.table} (${ev.i + 1}/${ev.total})…`); }
+  else if (t === "index_done") kbLog(`  indexed ${ev.table} in ${ev.seconds}s`, "muted");
+  else if (t === "index_error") kbLog(`  index skipped: ${ev.message || ""}`, "kb-err");
+  else if (t === "cvefixes_scan") setKbProg(kbLimit ? Math.min(ev.pairs / kbLimit, 0.99) : 0, `Scanning CVEfixes — ${ev.rows.toLocaleString()} rows, ${ev.pairs} pairs`);
+  else if (t === "cve_fetch") { if (ev.total) setKbProg(ev.index / ev.total, `Fetching CVEs ${ev.index + 1}/${ev.total}`); kbLog(`Fetching ${ev.cve} (${ev.index + 1}/${ev.total})…`); }
+  else if (t === "import_progress") { setKbProg(kbLimit ? Math.min(ev.items / kbLimit, 0.99) : 0, `Distilling… ${ev.items}/${kbLimit || "?"} items`); kbLog(`  ${ev.seen} pairs seen · ${ev.items} items${ev.skipped ? ` · ${ev.skipped} dup-skipped` : ""}…`, "muted"); }
+  else if (t === "distill") kbLog(`  distilling ${ev.cve} · ${ev.function || "?"}`, "muted");
+  else if (t === "dup_skip") kbLog(`  ${ev.cve} · ${ev.function || "?"} — already in KB, skipped`, "muted");
+  else if (t === "distill_error") kbLog(`  ${ev.cve} · ${ev.function}: ${ev.message} — skipped`, "kb-err");
+  else if (t === "cve_done") kbLog(`  ${ev.cve}: ${ev.items} item(s) from ${ev.pairs} pair(s)`);
+  else if (t === "cve_error") kbLog(`  ${ev.cve}: ${ev.message}`, "kb-err");
+  else if (t === "embed_error") kbLog(`  embedding failed: ${ev.message}`, "kb-err");
+  else if (t === "build_complete") {
+    const sk = ev.skipped ? `, ${ev.skipped} dup-skipped` : "";
+    setKbProg(1, `Done — ${ev.added} item(s) added${sk}`);
+    kbLog(`Done — added ${ev.added} item(s)${sk}.`, "kb-build-head");
+    (ev.errors || []).forEach((e) => kbLog("  ! " + e, "kb-err"));
+    toast(`Build complete: ${ev.added} item(s) added${sk}`);
+    loadKnowledge();
+  } else if (t === "build_error") {
+    kbLog("Build error: " + ev.message, "kb-err");
+    toast("Build error: " + ev.message, true);
+  } else if (t === "stream_end") {
+    if (kbBuildES) kbBuildES.close();
+  }
+}
+
 // ------------------------------------------------------------------ boot
 $("#am-close").addEventListener("click", closeAgentModal);
 $("#agent-modal").addEventListener("click", (e) => { if (e.target.id === "agent-modal") closeAgentModal(); });
@@ -806,4 +1236,5 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAgent
   } catch { $("#version").textContent = "offline"; }
   await initScanForm();
   await initIntensity();
+  refreshKbStats();  // show the KB status on the scan toggle
 })();

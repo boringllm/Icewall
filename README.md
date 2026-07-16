@@ -27,7 +27,9 @@ Icewall's design follows the 2025–2026 state of the art in LLM-based security:
   (cf. RepoAudit).
 - **A separate validator agent is the precision pillar.** Independent
   feasibility + guard-recognition cut false positives dramatically
-  (QASecClaw: −88.6% FPs; LLM4PFA/AdaTaint).
+  (QASecClaw: −88.6% FPs; LLM4PFA/AdaTaint). It can be augmented with a
+  **CVE-derived knowledge base** (Vul-RAG) to sharpen the vulnerable-vs-patched
+  decision — see [Knowledge base](#knowledge-base-vul-rag).
 - **Iterative context expansion.** Tracer subagents pull in only the functions
   they need, graph-backed (the Vulnhuntr move, made cheaper).
 - **Propose-only remediation.** AI patches can introduce new bugs
@@ -130,6 +132,10 @@ It's a thin layer over the same engine and gives you:
   transcript, then click any task to drill into the actual **LLM exchange** —
   the system prompt, the user input, the model's reasoning/thinking (when
   exposed), the answer, and token counts.
+- **Knowledge base (Vul-RAG)** — a **Knowledge** tab to build and browse a store
+  of vulnerability knowledge distilled from real CVEs, plus a one-click **Use
+  knowledge base** toggle on the Scan form that feeds retrieved knowledge to the
+  validator (see [Knowledge base](#knowledge-base-vul-rag) below).
 - **Session dashboard** — every scan is listed; open one for a **cost-per-agent**
   breakdown, the findings table, the saved code graph, agent memory, and download
   links for the markdown / SARIF / JSON artifacts.
@@ -241,6 +247,123 @@ memory:
   enabled: true
   share_across_stages: true   # feed recalled notes into the validator
 ```
+
+## Knowledge base (Vul-RAG)
+
+LLMs are notoriously bad at telling a vulnerable function from its *patched* look-
+alike — they pattern-match surface features instead of root causes (Vul-RAG,
+*arXiv:2406.11147*, measures ~0.06–0.14 pair accuracy for base prompting). Icewall's
+**validator** is the pillar against that failure, and the knowledge base sharpens
+it: a persistent store of vulnerability knowledge **distilled from real CVE fix
+commits**, retrieved per candidate and injected into the validator, which then
+checks whether the code exhibits a known **cause** while the corresponding **fix is
+absent**.
+
+It's **off by default**. Turn it on per scan (`--knowledge` / the UI toggle) once
+you've built a base. When enabled but empty/unreachable, validation runs exactly as
+it does today — the feature is purely additive.
+
+### How it works
+
+```
+Build (offline, occasional)                    Scan (per finding)
+────────────────────────────                   ─────────────────────────
+CVE id ──► fetch fix commit (OSV + GitHub)      candidate finding (class, sink)
+       ──► {vulnerable, patched} functions             │
+       ──► distiller LLM: cause + fix + semantics  retrieve top-k for that class
+       ──► embed (or BM25) ──► kb/items.jsonl  ──────► inject into the VALIDATOR:
+                                                       "cause present AND fix absent?"
+                                                          │
+                                                    verdict + cited CVEs → finding
+```
+
+- **Build** reuses Icewall's own tree-sitter parser to recover the exact functions
+  a fix commit changed, then a cheap **distiller** LLM turns each pair into a
+  structured item (`abstract_purpose`, `detailed_behavior`, `triggering_action`,
+  `abstract_cause`, `detailed_cause`, `fixing_solution`), with concrete names
+  abstracted away so the knowledge generalizes.
+- **Retrieval** filters by vulnerability class, then ranks by functional similarity
+  using an **embedding endpoint** when configured, or a local **BM25** fallback so
+  scans still work fully offline. Multiple query parts are fused with RRF.
+- Every KB-influenced verdict records the item ids it was shown (`Finding.
+  knowledge_refs`), so the reasoning is auditable ("the fix from CVE-… is present").
+
+### Building it
+
+Two providers, both OpenAI-compatible (a cheap chat model to distill, an optional
+embeddings model to retrieve):
+
+```bash
+icewall kb seed                              # cold-start from the bundled skills — no network
+icewall kb build --cve CVE-2023-1234 --cve CVE-2022-5678   # fetch + distill real CVEs
+icewall kb stats                             # what's in the base
+```
+
+…or do it all in the **Knowledge** tab of the web UI: point the distiller and
+embedding endpoints, paste CVE ids, watch the build stream, and browse the stored
+items. Then tick **Use knowledge base** on the Scan form.
+
+### Bulk import from a CVE dataset
+
+Typing CVE ids doesn't scale. To build a base **specialized in Python and web
+languages**, import a dataset you download once — Icewall filters it to Python /
+JavaScript / TypeScript (a `--language` flag adds more) and, by default, to its
+injection CWEs, then distills up to `--limit` items:
+
+```bash
+# CVEfixes — bundles the vulnerable+patched code, so NO GitHub access is needed
+# (the right path for locked-down networks). Convert the download to SQLite once…
+icewall kb prepare-cvefixes Data/CVEfixes_v1.0.8.sql.gz Data/CVEfixes.db   # no sqlite3 CLI needed
+#   (or, if you have the sqlite3 CLI: gzcat Data/…​.sql.gz | sqlite3 Data/CVEfixes.db)
+icewall kb import --source cvefixes --db Data/CVEfixes.db --limit 500
+
+# OSV ecosystem dumps — always current, but fetches each patch from GitHub
+icewall kb import --source osv --ecosystem PyPI --ecosystem npm --limit 500
+```
+
+`kb prepare-cvefixes` streams the (12.7 GB) dump into SQLite with no external
+tools — handy on Windows, where the `gzcat | sqlite3` one-liner needs both a
+gzip and a `sqlite3.exe` on PATH. It splits the dump on complete SQL statements
+so semicolons inside code columns don't corrupt it. Expect a large `.db` and a
+long run; the native `sqlite3` CLI is faster if you have it.
+
+| Source | Download | Needs GitHub at build time? |
+|---|---|---|
+| **CVEfixes** | [Zenodo / `secureIT-project/CVEfixes`](https://github.com/secureIT-project/CVEfixes) — a SQLite dump you convert with the command above | **No** — the code is in the dataset |
+| **OSV** | auto-downloaded per ecosystem (`…/PyPI/all.zip`, `…/npm/all.zip`) | **Yes** — records only reference the fix commit (set `github_token_env` to lift the API rate limit) |
+
+Both are also available in the Knowledge tab's **Import from a downloaded dataset**
+panel — and for CVEfixes you can just **point at the dataset folder**: Icewall
+finds the `.sql.gz`, converts it to SQLite the first time (skipped on re-runs), and
+imports, with a **progress bar** for the convert phase (by bytes) and the import
+phase (by items). The `--db` CLI flag likewise accepts the folder.
+
+Conversion picks the fast path automatically: it pipes into the native **`sqlite3`
+CLI when available** (the Linux default) and falls back to a **pure-Python loader**
+otherwise (Windows, no tool to install). The first import also creates a few
+**join indexes** on the converted db (a one-time step, seconds) — without them the
+un-indexed 50 GB db can't be queried at a usable speed. Flags: `--language`,
+`--cwe-filter/--no-cwe-filter`, `--limit`. Everything streams with SQL-side
+filters, so the (large) db is never loaded into memory, and `sqlite3` / `zipfile`
+are stdlib — no new dependency.
+
+```yaml
+knowledge:
+  enabled: false          # or pass --knowledge / use the UI toggle per scan
+  root: kb                # persistent, shippable store (kb/items.jsonl)
+  top_k: 6                # items injected into the validator per finding
+  distiller_provider: analyzer_provider
+  distiller_model: claude-haiku-4-5
+  embedding:
+    base_url: https://api.openai.com/v1
+    model: ""             # empty => local BM25 fallback (no embedding calls)
+    api_key_env: OPENAI_API_KEY
+```
+
+**Honesty:** knowledge RAG *helps* the vulnerable-vs-patched decision (the paper
+reports +16–24% pair accuracy) but does not *solve* it — treat it as a precision
+nudge on top of the validator, not a guarantee. The base you build is only as good
+as the CVEs you feed it, and its knowledge is scoped to Icewall's web-CWE classes.
 
 ## Agent skills
 
@@ -451,7 +574,7 @@ additive and never a hard dependency.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q     # 75 offline tests, no API keys
+python -m pytest tests/ -q     # 94 offline tests, no API keys
 ```
 
 ## Project layout
@@ -463,6 +586,7 @@ icewall/
   agents/        triage, tracer, analyzer, validator, remediator, summarizer
   orchestration/ thread pools, budget, context broker + manager, finding store
   detectors/     taint source/sink/sanitizer patterns
+  knowledge/     CVE-derived knowledge base (fetch, distill, embed, retrieve)
   skills/        markdown expertise loaded into agents at spawn (+ library/)
   sensors/       optional external-scanner seam (Semgrep stub, v1.1)
   report/        SARIF + markdown
@@ -470,7 +594,7 @@ icewall/
   workshop.py    per-session working folder (artifacts + memory)
   memory.py      session memory: master.md index + relevance recall
   engine.py      the orchestrator pipeline
-  cli.py         typer CLI (scan, graph, skills, ui, init-config, …)
+  cli.py         typer CLI (scan, graph, skills, kb, ui, init-config, …)
 examples/vulnerable_app/   deliberately-vulnerable sample repo
 tests/
 ```

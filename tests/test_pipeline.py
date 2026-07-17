@@ -59,6 +59,20 @@ def test_graph_builds_symbols():
     assert s["functions"] >= 10
 
 
+def test_glob_matcher_is_python_version_independent():
+    # Regression: builder must not rely on PurePosixPath.full_match (Python 3.13+),
+    # which raised AttributeError on 3.11/3.12 and produced an empty (0-file) graph.
+    from icewall.graph.builder import _matches_any
+
+    assert _matches_any("foo.py", ["**/*"])            # default include, top level
+    assert _matches_any("a/b/foo.py", ["**/*"])        # nested
+    assert _matches_any("src/node_modules/x.js", ["**/node_modules/**"])
+    assert _matches_any("node_modules/x.js", ["**/node_modules/**"])
+    assert _matches_any("a/app.min.js", ["**/*.min.js"])
+    assert not _matches_any("a/app.js", ["**/*.min.js"])
+    assert not _matches_any("foo.py", ["**/node_modules/**"])
+
+
 def test_graph_interprocedural_edge():
     g = build_graph(SAMPLE)
     ping = g.find("ping")[0]
